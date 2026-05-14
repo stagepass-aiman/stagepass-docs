@@ -1,0 +1,40 @@
+name: New Artifact
+description: New design artifact (PRD, NFR, OpenAPI spec, AsyncAPI schema, HLD, threat model, runbook, ER diagram)
+title: "docs(<scope>): <artifact name>"
+labels: ["docs"]
+body:
+  - type: dropdown
+    id: artifact-type
+    attributes:
+      label: Artifact Type
+      options:
+        - PRD
+        - NFR
+        - OpenAPI Spec
+        - AsyncAPI Schema
+        - HLD Diagram
+        - ER Diagram
+        - Threat Model
+        - Runbook
+        - Sequence Diagram
+    validations:
+      required: true
+  - type: input
+    id: target-path
+    attributes:
+      label: Target Path in Repo
+      description: "e.g. /docs/api/auth-service.yaml"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Document header block complete
+        - [ ] All traces-to references valid
+        - [ ] No contradictions with existing accepted ADRs
+        - [ ] Version control flow complete
+        - [ ] Uploaded to Claude Project knowledge base
+    validations:
+      required: true

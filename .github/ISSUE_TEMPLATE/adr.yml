@@ -1,0 +1,49 @@
+name: ADR
+description: Architecture Decision Record
+title: "docs(adr): ADR-NNN <short title>"
+labels: ["docs", "artifact:adr"]
+body:
+  - type: input
+    id: adr-number
+    attributes:
+      label: ADR Number
+      description: Next sequential number. Check docs/adr/ to confirm.
+      placeholder: "ADR-NNN"
+    validations:
+      required: true
+  - type: input
+    id: nfr-refs
+    attributes:
+      label: Applicable NFR IDs
+      description: "e.g. NFR-PERF-001, NFR-REL-005"
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Decision Context (2–3 sentences)
+      description: What problem forces a decision here?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] All sections in ADR-000-template.md are filled
+        - [ ] Status is Proposed or Accepted (not blank)
+        - [ ] Alternatives section has ≥ 2 options with reasons for rejection
+        - [ ] Quick Self-Check section has ≥ 2 questions
+        - [ ] No contradictions with existing Accepted ADRs
+        - [ ] Version control flow complete
+        - [ ] Uploaded to Claude Project knowledge base
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Phase
+      options:
+        - Phase 1 — Design
+    validations:
+      required: true

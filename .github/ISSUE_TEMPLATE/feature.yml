@@ -1,0 +1,53 @@
+name: Feature
+description: New feature or behaviour
+title: "feat(<scope>): "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in every field. Incomplete issues will not be worked.
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+      description: What is this and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Checkboxes. Each item must be independently verifiable.
+      value: |
+        - [ ] 
+        - [ ] 
+        - [ ] Version control flow complete (branch → PR → CI green → merged)
+        - [ ] Artifact uploaded to Claude Project knowledge base (if document)
+    validations:
+      required: true
+  - type: input
+    id: blocked-by
+    attributes:
+      label: Blocked By
+      description: "Format: org/repo#issue-number"
+    validations:
+      required: false
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Phase
+      options:
+        - Phase 0 — Foundation
+        - Phase 1 — Design
+        - Phase 2 — Infrastructure
+        - Phase 3 — Auth + Event
+        - Phase 4 — Core Services
+        - Phase 5 — AI/ML
+        - Phase 6 — Frontend
+        - Phase 7 — Quality
+        - Phase 8 — CI/CD
+        - Phase 9 — Cloud
+        - Phase 10 — Polish
+    validations:
+      required: true

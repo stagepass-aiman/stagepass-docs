@@ -1,0 +1,44 @@
+name: Bug
+description: Something is broken
+title: "fix(<scope>): "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What is broken?
+      description: Clear description of the incorrect behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      value: |
+        1. 
+        2. 
+        3. 
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Bug no longer reproducible
+        - [ ] Regression test added
+        - [ ] Version control flow complete
+    validations:
+      required: true
