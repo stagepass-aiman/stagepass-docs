@@ -1,0 +1,358 @@
+# File: ticket.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/ticket.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Ticket Service API
+  version: 1.0.0
+  description: |
+    Issues, stores, and serves tickets. Each ticket carries an HMAC-SHA256-signed
+    QR token encoding `ticketId + eventId + seatId + customerId + issuedAt`.
+    QR verification is signature-only — no network call required at check-in.
+    (NFR-SEC-005, PRD §7.7 — QR-based ticket verification)
+
+    Tickets are issued by consuming the `booking.confirmed` Kafka event.
+    They are invalidated (CANCELLED) by consuming `booking.cancelled`.
+
+    The QR secret is per-event, Admin-configurable, and rotated after event
+    completion. A token from one event cannot verify against another event's secret.
+    (NFR-SEC-005)
+
+    This service does NOT expose a public ticket-creation REST endpoint —
+    ticket issuance is purely event-driven. The REST API exposes read access
+    for Customers and a verify endpoint for the Check-in Service gRPC path.
+  x-service-tier: T2
+  x-repo: stagepass-ticket-service
+  x-traces-to:
+    - PRD §8.1 FR-C-005 (Customer ticket access)
+    - PRD §7.7 (QR-based verification)
+    - ADR-003 §3.3.2 (gRPC pair 2: Check-in → Ticket)
+    - NFR-SEC-005, NFR-SEC-006
+    - NFR-PERF-004
+
+servers:
+  - url: http://localhost:8087
+    description: Local development
+  - url: https://api.stagepass.dev/tickets
+    description: Staging
+
+tags:
+  - name: Tickets
+  - name: Health
+
+paths:
+
+  /tickets:
+    get:
+      operationId: listTickets
+      tags: [Tickets]
+      summary: List tickets for the authenticated Customer
+      description: |
+        - CUSTOMER: their own tickets only.
+        - ORGANISER: tickets for their events (for attendance tracking).
+        - ADMIN: all tickets.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: eventId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TicketStatus'
+      responses:
+        '200':
+          description: Paginated ticket list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /tickets/{ticketId}:
+    get:
+      operationId: getTicket
+      tags: [Tickets]
+      summary: Get a single ticket by ID
+      description: |
+        Customers can only retrieve their own tickets. Includes the signed QR token
+        payload. The Customer's mobile app encodes this payload as a QR code for
+        display at the event gate. (PRD FR-C-005)
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: Ticket detail including signed QR token payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tickets/{ticketId}/qr:
+    get:
+      operationId: getTicketQr
+      tags: [Tickets]
+      summary: Get the signed QR token string for a ticket
+      description: |
+        Returns the raw HMAC-SHA256-signed payload string to be encoded as a QR
+        code by the client. This is the canonical representation for gate scanning.
+
+        Format: base64url(`ticketId|eventId|seatId|customerId|issuedAt`) + "." + HMAC signature
+
+        The QR secret is per-event and stored in Vault. The Check-in Service fetches
+        the event key at startup and caches it for offline verification. (NFR-AVAIL-006)
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: Signed QR token string.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticketId, qrToken]
+                properties:
+                  ticketId:
+                    type: string
+                    format: uuid
+                  qrToken:
+                    type: string
+                    description: |
+                      HMAC-SHA256-signed token. Scan this at the gate.
+                      Verification is local — no network call required. (NFR-PERF-004)
+                  expiresAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+                    description: Null for standard tickets; set for time-limited offers.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tickets/{ticketId}/pdf:
+    get:
+      operationId: getTicketPdf
+      tags: [Tickets]
+      summary: Download a ticket as PDF
+      description: |
+        Returns a PDF ticket document including: event details, seat information,
+        QR code (pre-rendered), Customer name, booking reference.
+        PDF is stored in MinIO after first generation and served from cache.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: PDF ticket document.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="ticket-{ticketId}.pdf"'
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks PostgreSQL, Kafka consumer group, MinIO connectivity.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    TicketId:
+      name: ticketId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    TicketStatus:
+      type: string
+      enum: [VALID, USED, CANCELLED]
+
+    Ticket:
+      type: object
+      required: [ticketId, bookingId, eventId, seatId, customerId, status, qrToken, issuedAt]
+      properties:
+        ticketId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          description: Unique seat identifier (e.g. "N-A-12B").
+        customerId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        qrToken:
+          type: string
+          description: |
+            HMAC-SHA256-signed token. The mobile app encodes this as a QR code.
+            Token format: base64url(payload) + "." + HMAC-SHA256(payload, eventSecret)
+        pricingTierName:
+          type: string
+        unitPrice:
+          type: object
+          properties:
+            amount:
+              type: string
+              pattern: '^\d+\.\d{4}$'
+            currency:
+              type: string
+        usedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set on successful check-in.
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        issuedAt:
+          type: string
+          format: date-time
+
+    TicketPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        nextCursor:
+          type: string
+          nullable: true
+        prevCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or ticket not owned by caller.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Ticket not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

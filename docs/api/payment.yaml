@@ -1,0 +1,479 @@
+# File: payment.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/payment.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Payment Service API
+  version: 1.0.0
+  description: |
+    Manages payment order creation, Razorpay webhook receipt, refund initiation,
+    and idempotency for all money movements. Implemented with Quarkus (Java 21).
+
+    The payment lifecycle:
+    1. Booking Service calls POST /payments/orders to create a Razorpay payment order
+       (synchronous). Returns order ID + payment URL. (ADR-005 Step 3)
+    2. Customer completes payment on Razorpay-hosted page.
+    3. Razorpay calls POST /payments/webhook with the result.
+       The webhook is HMAC-SHA256 verified before processing. (NFR-REL-009)
+    4. Payment Service publishes `payment.confirmed` or `payment.failed` to Kafka.
+    5. Booking Service saga continues based on the Kafka event.
+
+    All amounts use the Money wire format: string with 4dp. (ADR-004 §3.3, NFR-REL-010)
+    All write endpoints accept an Idempotency-Key. (NFR-REL-001)
+
+    Payment down behaviour: checkout returns 503 with Retry-After; the seat hold
+    is automatically extended by 5 minutes. (NFR-AVAIL-003)
+  x-service-tier: T1
+  x-repo: stagepass-payment-service
+  x-traces-to:
+    - ADR-005 §3.4 Step 3 (Payment initiation in booking saga)
+    - ADR-008 (Revenue split)
+    - NFR-REL-001, NFR-REL-008, NFR-REL-009, NFR-REL-010
+    - NFR-AVAIL-003
+
+servers:
+  - url: http://localhost:8085
+    description: Local development
+  - url: https://api.stagepass.dev/payments
+    description: Staging
+
+tags:
+  - name: Orders
+    description: Payment order creation and retrieval
+  - name: Webhooks
+    description: Inbound Razorpay callbacks
+  - name: Refunds
+    description: Refund initiation and tracking
+  - name: Health
+
+paths:
+
+  /payments/orders:
+    post:
+      operationId: createPaymentOrder
+      tags: [Orders]
+      summary: Create a Razorpay payment order (Booking Service → Payment Service)
+      description: |
+        Called by the Booking Service saga to initiate a payment session.
+        Returns a Razorpay order ID and a checkout URL for the Customer.
+        Idempotent: re-submitting with the same Idempotency-Key returns the
+        existing order without creating a new Razorpay order.
+
+        RBAC: called by the Booking Service (service account) with role BOOKING_SVC.
+        The bookingId in the request is used to correlate the payment with the saga.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Payment order created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentOrder'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '503':
+          description: Razorpay upstream unavailable. Caller should retry with the same Idempotency-Key.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /payments/orders/{orderId}:
+    get:
+      operationId: getPaymentOrder
+      tags: [Orders]
+      summary: Get a payment order by ID
+      description: Used by Booking Service to poll order status if the webhook is delayed.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Payment order detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentOrder'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /payments/webhook:
+    post:
+      operationId: handleWebhook
+      tags: [Webhooks]
+      summary: Receive Razorpay payment webhook
+      description: |
+        Inbound callback from Razorpay. The signature in the `X-Razorpay-Signature`
+        header is verified using HMAC-SHA256 with the Razorpay webhook secret
+        (stored in Vault). Unverified webhooks return 401 and are logged as security
+        events. (NFR-REL-009)
+
+        This endpoint is unauthenticated for the caller (Razorpay does not hold a
+        StagePass JWT) but signature-authenticated. It is exposed only on an internal
+        path that the API Gateway routes from the Razorpay callback URL.
+
+        After successful verification and processing, publishes `payment.confirmed`
+        or `payment.failed` to Kafka. The endpoint is idempotent: duplicate webhook
+        deliveries for the same razorpay_payment_id are deduplicated.
+      security: []
+      parameters:
+        - name: X-Razorpay-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 signature from Razorpay.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RazorpayWebhookPayload'
+      responses:
+        '200':
+          description: Webhook processed.
+        '401':
+          description: Signature verification failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /payments/refunds:
+    post:
+      operationId: initiateRefund
+      tags: [Refunds]
+      summary: Initiate a refund for a payment (Booking Service → Payment Service)
+      description: |
+        Called by the Booking Service compensation saga after a booking is cancelled.
+        The refund amount is provided by the caller (Booking Service computes it per
+        the event's CancellationPolicy). This service does not recompute it.
+
+        Money amounts must be exact 4dp decimal strings. (ADR-004 §3.3)
+        Idempotent: duplicate refund requests with the same Idempotency-Key return
+        the existing refund without re-calling Razorpay.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitiateRefundRequest'
+      responses:
+        '202':
+          description: Refund accepted. Razorpay processes asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Payment order not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '409':
+          description: Refund amount exceeds original payment amount.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /payments/refunds/{refundId}:
+    get:
+      operationId: getRefund
+      tags: [Refunds]
+      summary: Get refund status
+      parameters:
+        - $ref: '#/components/parameters/RefundId'
+      responses:
+        '200':
+          description: Refund detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks PostgreSQL, Kafka producer, Razorpay API reachability.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Client-generated UUID for idempotent writes. (NFR-REL-001)
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RefundId:
+      name: refundId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string. (ADR-004 §3.3, NFR-REL-010)
+          example: "1250.0000"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          example: "INR"
+
+    PaymentOrderStatus:
+      type: string
+      enum: [CREATED, PAID, FAILED, REFUNDED, PARTIALLY_REFUNDED]
+
+    RefundStatus:
+      type: string
+      enum: [INITIATED, PROCESSING, SUCCEEDED, FAILED]
+
+    CreateOrderRequest:
+      type: object
+      required: [bookingId, customerId, amount]
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+          description: Saga correlation ID. Links the payment to the booking.
+        customerId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/Money'
+        description:
+          type: string
+          maxLength: 255
+          description: Human-readable description shown on Razorpay checkout page.
+
+    PaymentOrder:
+      type: object
+      required: [orderId, bookingId, status, amount, createdAt]
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        razorpayOrderId:
+          type: string
+          description: Razorpay's external order ID (e.g. "order_N8R...").
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/PaymentOrderStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        checkoutUrl:
+          type: string
+          format: uri
+          description: Razorpay-hosted checkout URL to redirect the Customer.
+        razorpayPaymentId:
+          type: string
+          nullable: true
+          description: Set after successful payment webhook.
+        paidAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    RazorpayWebhookPayload:
+      type: object
+      description: Razorpay webhook payload. Structure matches Razorpay v1 webhook spec.
+      required: [event, payload]
+      properties:
+        event:
+          type: string
+          description: e.g. "payment.captured", "payment.failed"
+        payload:
+          type: object
+          description: Razorpay event payload. Stored as-is for audit.
+
+    InitiateRefundRequest:
+      type: object
+      required: [orderId, bookingId, amount, reason]
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+          description: Saga correlation ID.
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Refund amount computed by Booking Service per CancellationPolicy.
+        reason:
+          type: string
+          maxLength: 500
+          description: e.g. "Customer cancellation", "Event cancelled by Organiser".
+
+    Refund:
+      type: object
+      required: [refundId, orderId, bookingId, amount, status, createdAt]
+      properties:
+        refundId:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        razorpayRefundId:
+          type: string
+          nullable: true
+        amount:
+          $ref: '#/components/schemas/Money'
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        reason:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT or HMAC signature.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

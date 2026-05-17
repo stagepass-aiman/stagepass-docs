@@ -1,0 +1,334 @@
+# File: recommendation.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/recommendation.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Recommendation Service API
+  version: 1.0.0
+  description: |
+    Serves personalised event recommendations using collaborative filtering
+    with user and event embeddings stored in Qdrant. Inference results are
+    cached in Redis (TTL: 10 minutes) to meet the p99 < 500ms target.
+    (NFR-PERF-012)
+
+    Degradation: if this service is down, the calling page renders a
+    "popular events" fallback (served from Search Service) — the page
+    never returns an error. (NFR-AVAIL-004)
+
+    Model lifecycle: offline training via MLflow; embedding updates are
+    async (not blocking the API). Fresh embeddings are pushed on model
+    promotion in the MLOps pipeline.
+  x-service-tier: T3
+  x-repo: stagepass-recommendation-service
+  x-traces-to:
+    - PRD §8.5 (AI features — personalised recommendations)
+    - NFR-PERF-012 (p99 < 500ms, Redis-cached inference)
+    - NFR-AVAIL-004 (fail-open fallback)
+
+servers:
+  - url: http://localhost:8091
+    description: Local development
+  - url: https://api.stagepass.dev/recommendations
+    description: Staging
+
+tags:
+  - name: Recommendations
+  - name: Health
+
+paths:
+
+  /recommendations:
+    get:
+      operationId: getPersonalisedRecommendations
+      tags: [Recommendations]
+      summary: Get personalised event recommendations for the authenticated Customer
+      description: |
+        Uses the Customer's booking history and preferences to retrieve the top-N
+        most similar events from Qdrant, filtered to PUBLISHED events with future dates.
+        Result is served from Redis cache when available. (NFR-PERF-012)
+
+        For unauthenticated or new Customers (cold start), falls back to popularity
+        ranking (most-booked events in the last 7 days).
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: excludeBooked
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Exclude events the Customer has already booked.
+      responses:
+        '200':
+          description: Personalised recommendations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /recommendations/similar/{eventId}:
+    get:
+      operationId: getSimilarEvents
+      tags: [Recommendations]
+      summary: Get events similar to a given event (item-to-item recommendations)
+      description: |
+        Uses event embeddings in Qdrant to find the most similar published events.
+        Shown on the event detail page ("You might also like").
+        Response time target: p99 < 500ms. (NFR-PERF-012)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 8
+      responses:
+        '200':
+          description: Similar events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /recommendations/popular:
+    get:
+      operationId: getPopularEvents
+      tags: [Recommendations]
+      summary: Get popularity-ranked events (fallback endpoint)
+      description: |
+        Returns most-booked events in the last 7 days. Used as the fallback when
+        personalised recommendations are unavailable. (NFR-AVAIL-004)
+        Does not require authentication — safe to call server-side during SSR.
+      security: []
+      parameters:
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Popularity-ranked events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+
+  /recommendations/feedback:
+    post:
+      operationId: submitFeedback
+      tags: [Recommendations]
+      summary: Submit implicit feedback to improve recommendation quality
+      description: |
+        Records implicit signals: click, view (>30s dwell), ignore, book.
+        Used as training data for the next model refresh cycle.
+        Fire-and-forget: this endpoint always returns 202 regardless of
+        downstream processing.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+      responses:
+        '202':
+          description: Feedback accepted for async processing.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks Qdrant and Redis cache connectivity.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    RecommendedEvent:
+      type: object
+      required: [eventId, title, eventDate, venueCity, score, scoreReason]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        posterUrl:
+          type: string
+          format: uri
+          nullable: true
+        eventDate:
+          type: string
+          format: date-time
+        venueCity:
+          type: string
+        minPrice:
+          type: object
+          properties:
+            amount:
+              type: string
+              pattern: '^\d+\.\d{4}$'
+            currency:
+              type: string
+        score:
+          type: number
+          format: double
+          description: Model score (higher = more relevant for this Customer).
+        scoreReason:
+          type: string
+          enum: [PERSONALISED, SIMILAR_EVENT, POPULAR, COLD_START_FALLBACK]
+
+    RecommendationResponse:
+      type: object
+      required: [items, cachedAt]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecommendedEvent'
+        cachedAt:
+          type: string
+          format: date-time
+          description: Timestamp when this result was cached (Redis hit). Null if freshly computed.
+          nullable: true
+        modelVersion:
+          type: string
+          nullable: true
+          description: MLflow model version that produced these recommendations.
+
+    FeedbackSignal:
+      type: string
+      enum: [CLICK, VIEW, IGNORE, BOOK, DISMISS]
+
+    FeedbackRequest:
+      type: object
+      required: [eventId, signal]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        signal:
+          $ref: '#/components/schemas/FeedbackSignal'
+        sessionId:
+          type: string
+          format: uuid
+          description: Optional session correlation for sequence modelling.
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

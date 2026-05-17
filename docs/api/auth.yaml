@@ -1,0 +1,786 @@
+# File: auth.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/auth.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Auth Service API
+  version: 1.0.0
+  description: |
+    Handles user registration, authentication, JWT issuance (RS256), token refresh,
+    logout (JTI revocation via Redis blocklist), and JWKS publication for local
+    validation by downstream services.
+
+    All endpoints except `/health/*` and `/auth/jwks` require a valid RS256 JWT
+    supplied in the `Authorization: Bearer <token>` header. (NFR-SEC-001)
+
+    Access token TTL ≤ 15 minutes. Refresh token TTL ≤ 7 days, rotated on every use.
+    (NFR-SEC-002)
+  contact:
+    name: StagePass Engineering
+    url: https://github.com/stagepass-aiman
+  x-service-tier: T1          # 99.9% SLO — 43 min/month downtime budget
+  x-repo: stagepass-auth-service
+  x-traces-to:
+    - PRD §6 (Actors and Roles)
+    - NFR-SEC-001
+    - NFR-SEC-002
+    - NFR-SEC-007
+    - ADR-003 §3.2.2
+
+servers:
+  - url: http://localhost:8081
+    description: Local development (Docker Compose)
+  - url: https://api.stagepass.dev/auth
+    description: Staging
+
+tags:
+  - name: Authentication
+    description: Registration, login, token refresh, logout
+  - name: Identity
+    description: Current user profile management
+  - name: Keys
+    description: JWKS public key publication for downstream JWT validation
+  - name: Health
+    description: Liveness and readiness probes
+
+paths:
+
+  # ─────────────────────────────────────────────
+  # Registration
+  # ─────────────────────────────────────────────
+  /auth/register:
+    post:
+      operationId: register
+      tags: [Authentication]
+      summary: Register a new user account
+      description: |
+        Creates a new user with one of the four platform roles: CUSTOMER, ORGANISER,
+        VENUE, ADMIN. ADMIN role registration is gated behind an existing ADMIN JWT
+        (enforced at the gateway). All other roles are open.
+
+        Passwords are hashed with bcrypt cost ≥ 12. (NFR-SEC-007)
+        An idempotency key prevents duplicate accounts on retry. (NFR-REL-001)
+      security: []   # Public endpoint — no JWT required
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              email: "aiman@example.com"
+              password: "S3cureP@ss!"
+              role: "CUSTOMER"
+              displayName: "Aiman"
+      responses:
+        '201':
+          description: Account created. Returns access and refresh tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '409':
+          description: Email already registered.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              example:
+                type: "https://stagepass.dev/problems/email-already-registered"
+                title: "Email Already Registered"
+                status: 409
+                detail: "An account with this email address already exists."
+                instance: "/auth/register"
+                traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ─────────────────────────────────────────────
+  # Login
+  # ─────────────────────────────────────────────
+  /auth/login:
+    post:
+      operationId: login
+      tags: [Authentication]
+      summary: Authenticate and receive a JWT pair
+      description: |
+        Validates credentials and issues an RS256-signed access token (TTL ≤ 15 min)
+        and a refresh token (TTL ≤ 7 days). The JTI (JWT ID) claim in the access token
+        enables targeted revocation via the Redis JTI blocklist without invalidating
+        all sessions.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: "aiman@example.com"
+              password: "S3cureP@ss!"
+      responses:
+        '200':
+          description: Authenticated. Returns access and refresh tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          description: Invalid credentials.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ─────────────────────────────────────────────
+  # Token Refresh
+  # ─────────────────────────────────────────────
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      tags: [Authentication]
+      summary: Exchange a refresh token for a new token pair
+      description: |
+        Rotates the refresh token on every use (token binding). The old refresh token
+        is immediately revoked. If the same refresh token is presented twice, the
+        second call receives 401 — this signals a possible token theft and should
+        trigger a full session revocation for the user. (NFR-SEC-002)
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          description: Refresh token invalid, expired, or already rotated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  # ─────────────────────────────────────────────
+  # Logout
+  # ─────────────────────────────────────────────
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [Authentication]
+      summary: Revoke the current access token (JTI blocklist)
+      description: |
+        Adds the JTI claim of the current access token to the Redis JTI blocklist
+        with a TTL equal to the remaining access token lifetime. Downstream services
+        perform local JWT validation and check the JTI blocklist on security-sensitive
+        endpoints. (ADR-003 §3.2.2)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Token revoked. No content returned.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ─────────────────────────────────────────────
+  # Current User Profile
+  # ─────────────────────────────────────────────
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [Identity]
+      summary: Get the authenticated user's profile
+      responses:
+        '200':
+          description: Current user profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    put:
+      operationId: updateCurrentUser
+      tags: [Identity]
+      summary: Update the authenticated user's profile
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+      responses:
+        '200':
+          description: Profile updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  # ─────────────────────────────────────────────
+  # Password Management
+  # ─────────────────────────────────────────────
+  /auth/password/change:
+    post:
+      operationId: changePassword
+      tags: [Identity]
+      summary: Change password (authenticated)
+      description: Requires the current password. Revokes all existing refresh tokens.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: Password changed. All sessions revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /auth/password/reset/request:
+    post:
+      operationId: requestPasswordReset
+      tags: [Authentication]
+      summary: Request a password reset email
+      description: |
+        Sends a time-limited reset link to the registered email.
+        Returns 204 regardless of whether the email exists to prevent
+        user enumeration. (OWASP OAT-016)
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '204':
+          description: Reset email dispatched (or silently discarded if unknown email).
+
+  /auth/password/reset/confirm:
+    post:
+      operationId: confirmPasswordReset
+      tags: [Authentication]
+      summary: Confirm password reset with token from email
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmPasswordResetRequest'
+      responses:
+        '204':
+          description: Password reset successful. All sessions revoked.
+        '401':
+          description: Reset token invalid or expired.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  # ─────────────────────────────────────────────
+  # JWKS Endpoint
+  # ─────────────────────────────────────────────
+  /auth/jwks:
+    get:
+      operationId: getJwks
+      tags: [Keys]
+      summary: Retrieve the RS256 public key set (JWKS)
+      description: |
+        Downstream services fetch this endpoint at startup and on key rotation to
+        validate JWTs locally without calling Auth Service on every request.
+        (ADR-003 §3.2.2 — no per-request auth call anti-pattern)
+
+        Response is Cache-Control: max-age=3600. Services must re-fetch on 401
+        from JWT validation (key may have rotated).
+      security: []
+      responses:
+        '200':
+          description: JSON Web Key Set.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: "max-age=3600"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JwksResponse'
+
+  # ─────────────────────────────────────────────
+  # Admin — User Management
+  # ─────────────────────────────────────────────
+  /auth/users:
+    get:
+      operationId: listUsers
+      tags: [Identity]
+      summary: List all users (Admin only)
+      description: Cursor-paginated list of all users. RBAC role ADMIN required.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: role
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserStatus'
+      responses:
+        '200':
+          description: Paginated user list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/users/{userId}/suspend:
+    post:
+      operationId: suspendUser
+      tags: [Identity]
+      summary: Suspend a user account (Admin only)
+      description: |
+        Suspending a user revokes all active refresh tokens. The user cannot log in
+        until reinstated. All Admin actions are logged with actorId and reason.
+        (PRD §6.4 — Admin constraints)
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '204':
+          description: User suspended.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /auth/users/{userId}/reinstate:
+    post:
+      operationId: reinstateUser
+      tags: [Identity]
+      summary: Reinstate a suspended user account (Admin only)
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: User reinstated.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ─────────────────────────────────────────────
+  # Health
+  # ─────────────────────────────────────────────
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      summary: Liveness probe — is the process alive?
+      description: Returns 200 if the JVM is running. No dependency checks.
+      security: []
+      responses:
+        '200':
+          description: Process alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      summary: Readiness probe — is the service ready to serve traffic?
+      description: |
+        Checks: PostgreSQL connectivity, Redis connectivity, JWKS key loaded.
+        Returns 503 if any check fails — Kubernetes will stop routing traffic
+        to this instance until it recovers.
+      security: []
+      responses:
+        '200':
+          description: All dependencies healthy. Ready to serve.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: One or more dependencies unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: RS256-signed JWT. Issued by Auth Service. Validated locally by each service using JWKS.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated UUID. If provided, the service caches the response for 24 hours
+        (Redis key: `auth:idem:<key>`). Repeat requests within the window return the
+        cached response without re-execution. (NFR-REL-001)
+      schema:
+        type: string
+        format: uuid
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque base64-encoded pagination cursor from a previous response.
+      schema:
+        type: string
+
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: Number of items per page. Default 20, max 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+
+    ProblemDetail:
+      type: object
+      description: RFC 9457 Problem Details. All non-2xx responses use this shape.
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI reference identifying the problem type.
+          example: "https://stagepass.dev/problems/email-already-registered"
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+          example: "Email Already Registered"
+        status:
+          type: integer
+          description: HTTP status code.
+          example: 409
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+          example: "An account with this email address already exists."
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying the specific occurrence.
+          example: "/auth/register"
+        traceId:
+          type: string
+          description: W3C traceparent trace ID for correlation with Jaeger. (NFR-OBS-003)
+          example: "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    UserRole:
+      type: string
+      enum: [CUSTOMER, ORGANISER, VENUE, ADMIN]
+      description: Platform role. Disjoint permissions enforced at service layer. (NFR-SEC-003)
+
+    UserStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED, PENDING_VERIFICATION]
+
+    RegisterRequest:
+      type: object
+      required: [email, password, role, displayName]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Will be hashed with bcrypt cost ≥ 12. (NFR-SEC-007)
+          writeOnly: true
+        role:
+          $ref: '#/components/schemas/UserRole'
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 100
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          writeOnly: true
+
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, expiresIn, tokenType]
+      properties:
+        accessToken:
+          type: string
+          description: RS256-signed JWT. TTL ≤ 15 minutes. Contains sub, jti, role, iat, exp.
+        refreshToken:
+          type: string
+          description: Opaque refresh token. TTL ≤ 7 days. Rotated on every use.
+        expiresIn:
+          type: integer
+          description: Access token lifetime in seconds. ≤ 900.
+          example: 900
+        tokenType:
+          type: string
+          enum: [Bearer]
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+
+    UserProfile:
+      type: object
+      required: [userId, email, role, displayName, status, createdAt]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/UserRole'
+        displayName:
+          type: string
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC
+        updatedAt:
+          type: string
+          format: date-time
+
+    UpdateProfileRequest:
+      type: object
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 100
+
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          writeOnly: true
+        newPassword:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+
+    ConfirmPasswordResetRequest:
+      type: object
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          description: Time-limited reset token from email link.
+        newPassword:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+
+    JwksResponse:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            description: JSON Web Key (RFC 7517). Contains kty, use, n, e, kid, alg fields.
+
+    UserPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserProfile'
+        nextCursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page. Null if this is the last page.
+        prevCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [UP, DOWN]
+          example:
+            postgres: "UP"
+            redis: "UP"
+            jwks: "UP"
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: "https://stagepass.dev/problems/unauthorized"
+            title: "Unauthorized"
+            status: 401
+            detail: "A valid Bearer token is required."
+            instance: "/auth/me"
+            traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    Forbidden:
+      description: Authenticated but insufficient role/permission.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+    UnprocessableEntity:
+      description: Request body failed validation.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ProblemDetail'
+              - type: object
+                properties:
+                  violations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        field:
+                          type: string
+                        message:
+                          type: string
+
+    TooManyRequests:
+      description: |
+        Rate limit exceeded. 100 req/min unauthenticated, 1000 req/min authenticated.
+        (NFR-SEC-009)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until the rate limit resets.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

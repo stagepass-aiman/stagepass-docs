@@ -1,0 +1,568 @@
+# File: booking.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/booking.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Booking Service API
+  version: 1.0.0
+  description: |
+    The Booking Service is the saga orchestrator for the customer purchase flow.
+    It coordinates Seat Inventory (gRPC hold → gRPC commit), Payment (REST), Ticket
+    Issuance (Kafka), and Notification (Kafka) across service boundaries. Every
+    forward step has a tested compensation. (ADR-005)
+
+    Booking state machine:
+    PENDING_HOLD → HOLD_CONFIRMED → PAYMENT_INITIATED → PAYMENT_CONFIRMED → CONFIRMED
+                 → HOLD_FAILED (compensation: no hold to release)
+                 → PAYMENT_FAILED (compensation: release hold)
+                 → CANCELLED (compensation: release hold + refund if paid)
+
+    This service exposes two read models:
+    - Write model (PostgreSQL): authoritative booking state for saga coordination.
+    - Read model (MongoDB CQRS): denormalised view for Customer "my bookings" queries.
+
+    Flash sale path: when Seat Inventory returns FLASH_SALE_MODE via gRPC, the
+    booking is enqueued to `flash-sale.hold-requests` Kafka topic instead of
+    holding seats synchronously. (ADR-007)
+
+    Idempotency: every write endpoint requires an Idempotency-Key. Duplicate
+    submissions within 24 hours return the cached response. (NFR-REL-001)
+  x-service-tier: T1
+  x-repo: stagepass-booking-service
+  x-traces-to:
+    - PRD §8.1 (Customer booking features)
+    - ADR-005 (Booking saga pattern)
+    - ADR-006 (Seat inventory concurrency)
+    - ADR-007 (Flash sale queue)
+    - NFR-REL-001, NFR-REL-003, NFR-REL-005, NFR-REL-008
+    - NFR-PERF-002, NFR-PERF-003
+
+servers:
+  - url: http://localhost:8084
+    description: Local development
+  - url: https://api.stagepass.dev/bookings
+    description: Staging
+
+tags:
+  - name: Bookings
+    description: Core booking lifecycle — create, read, cancel
+  - name: Health
+
+paths:
+
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Initiate a booking (Customer only)
+      description: |
+        Initiates the booking saga for one or more seats at an event. The synchronous
+        portion of this call (PENDING booking created, idempotency key returned) must
+        complete p99 < 2s. (NFR-PERF-002)
+
+        The saga proceeds asynchronously. The Customer receives real-time status
+        updates via WebSocket (Socket.IO room scoped to userId). The full saga
+        (checkout submit to WebSocket booking confirmation) must complete p99 < 10s.
+        (NFR-PERF-003)
+
+        Seats are selected as atomic all-or-nothing: all requested seats are held
+        or none are. (ADR-005 §3.4 Step 1)
+
+        If Seat Inventory signals FLASH_SALE_MODE, the booking is queued and the
+        caller receives 202 Accepted with a queue position. (ADR-007)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+            example:
+              eventId: "550e8400-e29b-41d4-a716-446655440000"
+              seatIds:
+                - "N-A-12B"
+                - "N-A-12C"
+              pricingTierId: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+      responses:
+        '202':
+          description: |
+            Booking accepted. The saga is running asynchronously.
+            Use the returned bookingId to poll /bookings/{bookingId}/status or
+            listen on the WebSocket room for real-time updates.
+
+            If `flashSaleQueued: true`, the caller is in a flash sale queue.
+            `queuePosition` indicates their place in the queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingCreatedResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            One or more requested seats are not available (HELD or BOOKED by another
+            booking). The response body lists the unavailable seatIds.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetail'
+                  - type: object
+                    properties:
+                      unavailableSeatIds:
+                        type: array
+                        items:
+                          type: string
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    get:
+      operationId: listBookings
+      tags: [Bookings]
+      summary: List bookings for the authenticated caller
+      description: |
+        - CUSTOMER: their own bookings.
+        - ORGANISER: bookings for their events.
+        - ADMIN: all bookings (with filters).
+        Backed by the MongoDB CQRS read model for Customers and Organisers.
+        (NFR-REL-008 — read model is eventually consistent with write model)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: eventId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+      responses:
+        '200':
+          description: Paginated booking list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /bookings/{bookingId}:
+    get:
+      operationId: getBooking
+      tags: [Bookings]
+      summary: Get a single booking by ID
+      description: |
+        Customers can only retrieve their own bookings. Organisers can retrieve
+        bookings for their events. Admins can retrieve any booking.
+        Tenant isolation violation returns 403 and logs a security event. (NFR-SEC-004)
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Booking detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/status:
+    get:
+      operationId: getBookingStatus
+      tags: [Bookings]
+      summary: Poll the current saga status of a booking
+      description: |
+        Lightweight polling endpoint returning only the current status and any
+        failure reason. Customers may poll this while awaiting WebSocket confirmation.
+        Prefer WebSocket over polling in production clients.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Current booking status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingStatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/cancel:
+    post:
+      operationId: cancelBooking
+      tags: [Bookings]
+      summary: Cancel a booking and initiate refund (Customer or Admin)
+      description: |
+        Cancels a CONFIRMED booking. Initiates the compensation saga:
+        1. Seat states released to AVAILABLE (published via Kafka → Seat Inventory)
+        2. Refund computed per the event's CancellationPolicy
+        3. Refund initiated via Payment Service
+        4. Revenue split reduced in Disbursement Service ledger
+        5. Ticket invalidated
+        6. Customer notified
+
+        Idempotent: cancelling an already-cancelled booking returns success with
+        no duplicate refund processed. (NFR-REL-011)
+
+        The cancellation request records the actor (Customer self-cancel vs Admin
+        forced cancel) for audit. (PRD §6.4 Admin constraints)
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Required when Admin cancels on behalf of Customer.
+      responses:
+        '202':
+          description: Cancellation accepted. Compensation saga running asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingStatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Booking cannot be cancelled in its current state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks PostgreSQL (write model), MongoDB (read model), Redis (idempotency cache), Kafka producer connectivity.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Client-generated UUID. Cached response returned on replay within 24h. (NFR-REL-001)
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string. (ADR-004 §3.3)
+          example: "1250.0000"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          example: "INR"
+
+    BookingStatus:
+      type: string
+      enum:
+        - PENDING_HOLD
+        - HOLD_CONFIRMED
+        - PAYMENT_INITIATED
+        - PAYMENT_CONFIRMED
+        - CONFIRMED
+        - HOLD_FAILED
+        - PAYMENT_FAILED
+        - CANCELLED
+
+    RevenueSplit:
+      type: object
+      description: |
+        Computed once at booking time and stored as immutable ledger entries.
+        Never recomputed — refunds are proportional to these original amounts.
+        (ADR-008, NFR-REL-012)
+      required: [platformFee, venueShare, organiserShare, totalAmount]
+      properties:
+        platformFee:
+          $ref: '#/components/schemas/Money'
+        venueShare:
+          $ref: '#/components/schemas/Money'
+        organiserShare:
+          $ref: '#/components/schemas/Money'
+        gstAmount:
+          $ref: '#/components/schemas/Money'
+        totalAmount:
+          $ref: '#/components/schemas/Money'
+
+    BookedSeat:
+      type: object
+      required: [seatId, pricingTierId, unitPrice]
+      properties:
+        seatId:
+          type: string
+          description: Unique seat identifier (e.g. "N-A-12B").
+        pricingTierId:
+          type: string
+          format: uuid
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+
+    CreateBookingRequest:
+      type: object
+      required: [eventId, seatIds, pricingTierId]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 10
+          description: All seats in this booking must be from the same pricing tier.
+        pricingTierId:
+          type: string
+          format: uuid
+
+    BookingCreatedResponse:
+      type: object
+      required: [bookingId, status]
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        flashSaleQueued:
+          type: boolean
+          default: false
+          description: True if the booking was queued for flash sale processing.
+        queuePosition:
+          type: integer
+          nullable: true
+          description: Position in flash sale queue. Null if not a flash sale booking.
+
+    Booking:
+      type: object
+      required: [bookingId, customerId, eventId, status, seats, createdAt]
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        seats:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookedSeat'
+        revenueSplit:
+          $ref: '#/components/schemas/RevenueSplit'
+          description: Populated once booking reaches CONFIRMED.
+        paymentOrderId:
+          type: string
+          format: uuid
+          nullable: true
+        ticketIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Populated once Ticket Service issues tickets.
+        failureReason:
+          type: string
+          nullable: true
+          description: Set if the saga reached a terminal failure state.
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancellationReason:
+          type: string
+          nullable: true
+        refundAmount:
+          $ref: '#/components/schemas/Money'
+          description: Populated after a cancellation refund is initiated.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    BookingStatusResponse:
+      type: object
+      required: [bookingId, status]
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        failureReason:
+          type: string
+          nullable: true
+
+    BookingPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Booking'
+        nextCursor:
+          type: string
+          nullable: true
+        prevCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or tenant isolation violation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,376 @@
+# File: check-in.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/check-in.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Check-in Service API
+  version: 1.0.0
+  description: |
+    Handles QR code scanning and gate check-in at events. Verification is
+    HMAC-SHA256 signature-only — no database call in the hot path. (NFR-PERF-004 — p99 < 200ms)
+
+    On startup, this service fetches per-event QR secrets from Vault and caches
+    them locally. If the service is down or disconnected, staff can still scan
+    tickets using the cached event key — attendance sync happens on recovery.
+    (NFR-AVAIL-006 — offline fallback)
+
+    Check-in is idempotent: scanning the same QR code twice returns success with
+    `alreadyCheckedIn: true`. No duplicate check-in record is created. (NFR-SEC-006)
+
+    The gRPC path (Check-in Service → Ticket Service) is used for initial token
+    verification during service startup and for status updates. The REST endpoints
+    here are for the gate scanning UI and attendance queries. (ADR-003 §3.3.2)
+  x-service-tier: T2
+  x-repo: stagepass-check-in-service
+  x-traces-to:
+    - PRD §7.7 (QR-based ticket verification)
+    - ADR-003 §3.3.2 (gRPC pair 2)
+    - NFR-PERF-004 (p99 < 200ms)
+    - NFR-SEC-005, NFR-SEC-006
+    - NFR-AVAIL-006 (offline fallback)
+
+servers:
+  - url: http://localhost:8088
+    description: Local development
+  - url: https://api.stagepass.dev/check-in
+    description: Staging
+
+tags:
+  - name: CheckIn
+    description: QR scanning and check-in recording
+  - name: Attendance
+    description: Real-time and historical attendance data
+  - name: Health
+
+paths:
+
+  /check-ins/verify:
+    post:
+      operationId: verifyAndCheckIn
+      tags: [CheckIn]
+      summary: Verify a QR token and record check-in
+      description: |
+        The gate scanner submits the raw QR token string. This service:
+        1. Parses the token payload (ticketId, eventId, seatId, customerId, issuedAt)
+        2. Verifies the HMAC-SHA256 signature using the cached event secret
+        3. Checks ticket status (VALID → USED; rejects CANCELLED)
+        4. Records the check-in with timestamp (PostgreSQL) and marks ticket as USED
+        5. Publishes `checkin.recorded` Kafka event for attendance counters
+
+        Steps 1–3 require NO network call beyond the local cache. Step 4–5 are
+        async-safe: if the DB write fails transiently, the local record is queued
+        for retry. Signature validity is the gate. (NFR-PERF-004)
+
+        Returns `alreadyCheckedIn: true` if the ticket was already used — no duplicate
+        check-in created. (NFR-SEC-006)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequest'
+      responses:
+        '200':
+          description: |
+            Verification result. Even if `alreadyCheckedIn: true`, status is 200
+            (not 409) — gate scanners must not block on repeated scans.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller does not have gate-scanner role for this event.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '422':
+          description: QR token is invalid, expired, or signature verification failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /check-ins/{eventId}/attendance:
+    get:
+      operationId: getAttendance
+      tags: [Attendance]
+      summary: Get real-time attendance for an event
+      description: |
+        Returns total expected attendance (CONFIRMED bookings), actual check-ins
+        so far, and a live counter updated from Kafka. Intended for Venue staff
+        dashboards and Organiser live operations view. (PRD FR-O-004, FR-V-004)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Current attendance statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /check-ins/{eventId}/log:
+    get:
+      operationId: getCheckInLog
+      tags: [Attendance]
+      summary: Get check-in log for an event (paginated)
+      description: Organiser and Venue actors can retrieve check-in records for their events.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated check-in log.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInLogPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: |
+        Checks PostgreSQL, Kafka consumer group, and event secret cache population.
+        Note: service is designed to remain operational even if Kafka connectivity
+        is temporarily lost (offline fallback mode). (NFR-AVAIL-006)
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    CheckInRequest:
+      type: object
+      required: [qrToken, eventId]
+      properties:
+        qrToken:
+          type: string
+          description: Raw HMAC-SHA256-signed QR token string from the Customer's ticket.
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            The event for which gate scanning is occurring. Used to select the
+            correct event secret from the local cache.
+        scannedBy:
+          type: string
+          format: uuid
+          description: userId of the gate scanner (Venue staff). Logged for audit.
+
+    CheckInResult:
+      type: object
+      required: [valid, alreadyCheckedIn]
+      properties:
+        valid:
+          type: boolean
+          description: True if the QR signature is valid and the ticket is VALID or already used.
+        alreadyCheckedIn:
+          type: boolean
+          description: True if the ticket was already scanned. Gate should show a warning, not block.
+        ticketId:
+          type: string
+          format: uuid
+          nullable: true
+        seatId:
+          type: string
+          nullable: true
+        customerDisplayName:
+          type: string
+          nullable: true
+          description: Shown on gate scanner display for visual confirmation.
+        checkedInAt:
+          type: string
+          format: date-time
+          nullable: true
+        failureReason:
+          type: string
+          nullable: true
+          description: Set when valid=false. e.g. "INVALID_SIGNATURE", "TICKET_CANCELLED", "WRONG_EVENT".
+
+    AttendanceStats:
+      type: object
+      required: [eventId, expectedAttendance, actualCheckIns, checkInRate]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        expectedAttendance:
+          type: integer
+          description: Total CONFIRMED bookings for this event.
+        actualCheckIns:
+          type: integer
+          description: Total unique valid check-ins recorded so far.
+        checkInRate:
+          type: number
+          format: double
+          description: actualCheckIns / expectedAttendance (0.0 – 1.0).
+        lastUpdatedAt:
+          type: string
+          format: date-time
+
+    CheckInLogEntry:
+      type: object
+      required: [checkInId, ticketId, seatId, checkedInAt]
+      properties:
+        checkInId:
+          type: string
+          format: uuid
+        ticketId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+        customerId:
+          type: string
+          format: uuid
+        scannedBy:
+          type: string
+          format: uuid
+          nullable: true
+        checkedInAt:
+          type: string
+          format: date-time
+        offline:
+          type: boolean
+          description: True if this record was captured offline and synced later.
+
+    CheckInLogPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckInLogEntry'
+        nextCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []
