@@ -1,0 +1,771 @@
+# ============================================================
+# seat.yaml
+#
+# AsyncAPI 2.6 contract — Seat Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/seat.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Authoritative topic catalogue
+#   ADR-006 §3.9    — Seat state machine (AVAILABLE/HELD/BOOKED/BLOCKED)
+#   ADR-006 §3.10   — Redis key schema
+#   ADR-007         — Flash sale context (seat state changes are
+#                     published by Seat Inventory after both gRPC and
+#                     Kafka-path hold operations)
+#   NFR-PERF-005    — Seat map WebSocket push p99 < 1s
+#   NFR-REL-002     — Consumer idempotency
+#   NFR-REL-007     — DLQ per topic
+#
+# NAMING NOTE:
+#   The task brief refers to this topic as "seat.events".
+#   ADR-003 §3.4.2 (the locked authority) names it "seat.state-changes".
+#   This file uses "seat.state-changes" throughout, which is the
+#   authoritative name. "seat.events" in any other document should
+#   be treated as a synonym for "seat.state-changes".
+#
+# Topics covered:
+#   seat.state-changes      (24 partitions, key=eventId, 1-day retention)
+#   seat.commands           (24 partitions, key=eventId, 3-day retention)
+#   seat.state-changes.dlq  (24 partitions, 14-day retention)
+#   seat.commands.dlq       (24 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: urn:stagepass:asyncapi:seat
+
+info:
+  title: StagePass — Seat Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Seat domain** Kafka topics.
+
+    **`seat.state-changes`** is published by the Seat Inventory Service
+    whenever a seat's state transitions. This topic feeds the real-time
+    seat map in the browser (via Notification Service → WebSocket) and
+    allows the Booking Service to track seat state for reconciliation.
+
+    **`seat.commands`** is consumed by the Seat Inventory Service for
+    bulk and administrative seat operations (Admin blocking, event
+    cancellation seat release). Individual seat hold/commit/release
+    operations during the booking saga use gRPC (ADR-003 §3.3.2,
+    ADR-005 Step 1/4) — not this Kafka topic — because gRPC provides
+    the synchronous response required by the saga.
+
+    **Partition key: eventId (both topics).**
+    All seat state changes for a given event land on the same partition.
+    The Notification Service consumer observes AVAILABLE→HELD→BOOKED in
+    strict order for each seat — which is required to render an accurate
+    real-time seat map (NFR-PERF-005: p99 < 1s push from state change to
+    client WebSocket receipt). 24 partitions support 24 concurrent events
+    without cross-event ordering interference.
+  contact:
+    name: StagePass Platform Team
+    url: https://github.com/stagepass-aiman/stagepass-docs
+    email: platform@stagepass.internal
+  license:
+    name: Proprietary — StagePass internal
+
+tags:
+  - name: seat-inventory
+    description: Seat state machine events and commands — ADR-006
+
+defaultContentType: application/json
+
+servers:
+  kafka-local:
+    url: 'kafka:9092'
+    protocol: kafka
+    description: Apache Kafka (Strimzi) — local Docker Compose stack.
+  kafka-staging:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: Amazon MSK — staging / production
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap endpoint
+
+channels:
+
+  # ----------------------------------------------------------
+  # seat.state-changes
+  # ADR-003 §3.4.2 — 24 partitions, key=eventId, 1-day retention
+  # Authoritative name for the topic the task brief calls "seat.events"
+  # ----------------------------------------------------------
+  seat.state-changes:
+    description: |
+      Seat state-change events published by the Seat Inventory Service
+      whenever a seat transitions between states in the seat state machine
+      (ADR-006 §3.9): AVAILABLE ↔ HELD ↔ BOOKED, AVAILABLE ↔ BLOCKED.
+
+      **Real-time seat map (NFR-PERF-005):**
+      The Notification Service (notification-service-consumer) receives
+      state change events and pushes them to the Socket.IO room scoped
+      to `eventId`. All browser clients viewing the seat map for that event
+      receive the update within 1s p99. This is the WebSocket feed that
+      makes seat state "live" in the UI.
+
+      **State transitions published here:**
+        AVAILABLE → HELD        After gRPC HoldSeats (normal path) or
+                                after Seat Inventory consumes flash-sale.hold-requests
+        HELD → AVAILABLE        After gRPC ReleaseSeats (compensation) OR
+                                after Redis TTL expiry (NFR-REL-004)
+        HELD → BOOKED           After gRPC CommitSeats (payment confirmed)
+        AVAILABLE → BLOCKED     Admin action via seat.commands
+        BLOCKED → AVAILABLE     Admin action via seat.commands
+        BOOKED → AVAILABLE      Post-event conclusion or booking cancellation
+
+      **Low retention (1 day):**
+      Consumers of this topic are online services (Notification, Booking
+      reconciliation). The full seat state is always queryable from
+      PostgreSQL and Redis — this topic is a change-data-capture feed,
+      not the source of truth.
+
+      **Consumer fan-out:**
+        - notification-service-consumer:  pushes seat map updates to browsers
+        - booking-service-consumer:       reconciliation and saga state sync
+        (Analytics is not in ADR-003's consumer list for this topic;
+         analytics data is derived from booking.events, not raw seat state changes.)
+    x-producer: seat-inventory-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - notification-service-consumer
+      - booking-service-consumer
+    bindings:
+      kafka:
+        topic: seat.state-changes
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 86400000      # 1 day — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveSeatStateChange
+      summary: Receive a seat state-change event
+      description: |
+        The Notification Service must forward each SeatStateChanged event to
+        the Socket.IO room `eventId:{eventId}` within the NFR-PERF-005 budget
+        (1s p99 from Kafka publish to WebSocket receipt). Consumer lag on this
+        topic is a leading indicator of seat map freshness and is tracked in
+        Grafana (NFR-OBS-005).
+      message:
+        oneOf:
+          - $ref: '#/components/messages/SeatStateChanged'
+          - $ref: '#/components/messages/SeatHoldExpired'
+          - $ref: '#/components/messages/BulkSeatStateChanged'
+
+  # ----------------------------------------------------------
+  # seat.commands
+  # ADR-003 §3.4.2 — 24 partitions, key=eventId, 3-day retention
+  # ----------------------------------------------------------
+  seat.commands:
+    description: |
+      Commands directed at the Seat Inventory Service for bulk and
+      administrative seat operations. Consumed exclusively by
+      seat-inventory-service-consumer.
+
+      **Why Kafka for commands (not gRPC)?**
+      These operations are low-frequency, bulk, and not time-critical:
+        - Admin blocking a section for wheelchair access: no 500ms SLA.
+        - Event cancellation releasing all seats: may affect thousands
+          of seats; async fan-out is appropriate.
+
+      Individual per-booking seat hold/commit/release operations use gRPC
+      (ADR-003 §3.3.2) because the saga requires a synchronous response
+      within the 2s checkout latency budget (NFR-PERF-002).
+
+      After processing a command, the Seat Inventory Service publishes the
+      resulting state changes to seat.state-changes for real-time propagation.
+    x-producer: admin-service, event-service, booking-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - seat-inventory-service-consumer
+    bindings:
+      kafka:
+        topic: seat.commands
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 259200000     # 3 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveSeatCommand
+      summary: Receive a seat administrative command
+      message:
+        oneOf:
+          - $ref: '#/components/messages/BlockSeatsCommand'
+          - $ref: '#/components/messages/UnblockSeatsCommand'
+          - $ref: '#/components/messages/ReleaseAllEventSeatsCommand'
+
+  # ----------------------------------------------------------
+  # seat.state-changes.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  seat.state-changes.dlq:
+    description: |
+      Dead-letter queue for seat.state-changes (NFR-REL-007).
+      A dead-lettered seat.state-changes message means the Notification
+      Service or Booking reconciliation consumer failed to process a
+      seat state transition. This may cause stale seat state in the UI.
+      KafkaDLQDepthNonZero alert runbook: /docs/runbooks/kafka-dlq-depth.md.
+    x-original-topic: seat.state-changes
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - seat-state-changes-dlq-consumer
+    bindings:
+      kafka:
+        topic: seat.state-changes.dlq
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveSeatStateChangeDLQ
+      summary: Receive a dead-lettered seat state-change event
+      message:
+        $ref: '#/components/messages/DeadLetteredSeatMessage'
+
+  # ----------------------------------------------------------
+  # seat.commands.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  seat.commands.dlq:
+    description: |
+      Dead-letter queue for seat.commands (NFR-REL-007).
+      A dead-lettered BlockSeatsCommand means the Admin's block operation
+      failed silently — seats may still appear AVAILABLE when they should
+      be BLOCKED. Investigate immediately.
+    x-original-topic: seat.commands
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - seat-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: seat.commands.dlq
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveSeatCommandDLQ
+      summary: Receive a dead-lettered seat command for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredSeatMessage'
+
+components:
+
+  messages:
+
+    SeatStateChanged:
+      messageId: SeatStateChanged
+      name: SeatStateChanged
+      title: Seat State Changed
+      summary: A single seat has transitioned to a new state.
+      description: |
+        The primary seat map update event. Published after every individual
+        seat transition: gRPC HoldSeats/CommitSeats/ReleaseSeats result,
+        Redis TTL expiry detection, or Admin block/unblock via seat.commands.
+
+        **fromState + toState:** The state machine only permits transitions
+        documented in ADR-006 §3.9. Consumers MUST ignore messages where
+        `fromState == toState` (idempotency safety — NFR-REL-002).
+
+        **bookingId presence:** Present when transition is AVAILABLE→HELD or
+        HELD→BOOKED (identifies which booking holds/owns the seat). Absent
+        for HELD→AVAILABLE (TTL expiry — no bookingId to reference) and
+        Admin BLOCKED transitions.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/SeatStateChangedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId
+
+    SeatHoldExpired:
+      messageId: SeatHoldExpired
+      name: SeatHoldExpired
+      title: Seat Hold Expired
+      summary: A seat hold auto-expired via Redis TTL. Seat returns to AVAILABLE.
+      description: |
+        Published when a Redis keyspace expiry notification is detected for a
+        seat hold key (ADR-006 §3.10: `NOTIFY_KEYSPACE_EVENTS Kx`).
+        This transitions the seat HELD → AVAILABLE in PostgreSQL and notifies
+        the Notification Service to update the seat map.
+
+        **No bookingId in payload:** The Redis key expiry does not carry the
+        bookingId. The Seat Inventory Service correlates the expired key with
+        the seat_holds table in PostgreSQL to identify the associated booking
+        and publish the bookingId for the Notification Service to use in the
+        "hold expired" WebSocket event to the customer's userId room.
+
+        **Why a separate event type?** SeatHoldExpired carries different
+        operational semantics from SeatStateChanged: it signals that a
+        booking checkout timed out, not that a user action occurred. The
+        Notification Service routes these to different WebSocket event types.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/SeatHoldExpiredPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId
+
+    BulkSeatStateChanged:
+      messageId: BulkSeatStateChanged
+      name: BulkSeatStateChanged
+      title: Bulk Seat State Changed
+      summary: Multiple seats for one event changed state in a single batch operation.
+      description: |
+        Published after bulk Admin operations (BlockSeats, UnblockSeats) or
+        after ReleaseAllEventSeatsCommand (event cancellation). Carrying all
+        affected seatIds in one message reduces Kafka message count for
+        large-venue events (50,000+ seats — PRD §7.1).
+
+        **Notification Service handling:** For large bulks (> 1,000 seats),
+        the Notification Service publishes a single WebSocket event to the
+        `eventId` room containing only the diff (affected seatIds + newState)
+        rather than the full seat map. The browser client applies the diff.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BulkSeatStateChangedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId
+
+    BlockSeatsCommand:
+      messageId: BlockSeatsCommand
+      name: BlockSeatsCommand
+      title: Block Seats Command
+      summary: Admin command to block one or more seats (e.g. wheelchair, VIP reserve).
+      description: |
+        Transitions specified seats from AVAILABLE → BLOCKED.
+        Blocked seats cannot be held or booked by customers (ADR-006 §3.9).
+        The Seat Inventory Service publishes a BulkSeatStateChanged event
+        to seat.state-changes after processing.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BlockSeatsCommandPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId
+
+    UnblockSeatsCommand:
+      messageId: UnblockSeatsCommand
+      name: UnblockSeatsCommand
+      title: Unblock Seats Command
+      summary: Admin command to return BLOCKED seats to AVAILABLE.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/UnblockSeatsCommandPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    ReleaseAllEventSeatsCommand:
+      messageId: ReleaseAllEventSeatsCommand
+      name: ReleaseAllEventSeatsCommand
+      title: Release All Event Seats Command
+      summary: |
+        Releases all HELD and BOOKED seats for an event (event cancellation or
+        venue suspension). This is the compensation action for seats during the
+        event cancellation cascade (ADR-005 §3.3 compensation path).
+      description: |
+        The Seat Inventory Service processes this command by:
+          1. Deleting all Redis keys for the event (DEL seat:{eventId}:*)
+          2. Updating all seat_state rows for eventId to AVAILABLE in PostgreSQL
+          3. Publishing a BulkSeatStateChanged event to seat.state-changes
+
+        This is idempotent: calling for an event where all seats are already
+        AVAILABLE is a no-op (NFR-REL-011 — cancellation idempotency).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/ReleaseAllEventSeatsCommandPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId
+
+    DeadLetteredSeatMessage:
+      name: DeadLetteredSeatMessage
+      title: Dead-Lettered Seat Message
+      summary: A seat domain message that failed delivery after 3 attempts.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassDLQHeaders'
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      description: Standard Kafka headers per ADR-003 §3.4.1.
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+          example: 'seat.state-changed'
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          example: '1.0.0'
+
+    StagePassDLQHeaders:
+      allOf:
+        - $ref: '#/components/schemas/StagePassMessageHeaders'
+        - type: object
+          required: [x-failure-reason, x-original-topic, x-delivery-attempt]
+          properties:
+            x-failure-reason:
+              type: string
+            x-original-topic:
+              type: string
+            x-original-partition:
+              type: integer
+            x-original-offset:
+              type: integer
+              format: int64
+            x-failure-timestamp:
+              type: string
+              format: date-time
+            x-delivery-attempt:
+              type: integer
+              const: 3
+
+    SeatState:
+      type: string
+      enum: [AVAILABLE, HELD, BOOKED, BLOCKED]
+      description: |
+        Seat states per ADR-006 §3.9:
+          AVAILABLE — Free for selection. Redis key absent.
+          HELD      — Reserved for a booking (Redis key present, TTL=600s).
+          BOOKED    — Committed after payment. Redis key present, no TTL.
+          BLOCKED   — Admin-blocked. PostgreSQL only; no Redis key.
+
+    SeatStateChangedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - seatId
+        - eventId
+        - fromState
+        - toState
+        - transitionReason
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer deduplication key (NFR-REL-002).
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'seat.state-changed'
+        seatId:
+          type: string
+          format: uuid
+          description: Non-fungible seat identifier. 12B ≠ 12C.
+        eventId:
+          type: string
+          format: uuid
+          description: Partition key — all state changes for one event on one partition.
+        sectionId:
+          type: string
+          format: uuid
+        row:
+          type: string
+          example: 'A'
+        seatNumber:
+          type: string
+          example: '12B'
+        fromState:
+          $ref: '#/components/schemas/SeatState'
+        toState:
+          $ref: '#/components/schemas/SeatState'
+        transitionReason:
+          type: string
+          enum:
+            - HOLD_CREATED         # AVAILABLE → HELD (gRPC HoldSeats or flash sale consumer)
+            - HOLD_RELEASED        # HELD → AVAILABLE (gRPC ReleaseSeats, saga compensation)
+            - HOLD_EXPIRED         # HELD → AVAILABLE (Redis TTL expiry, NFR-REL-004)
+            - BOOKING_COMMITTED    # HELD → BOOKED (gRPC CommitSeats, payment confirmed)
+            - BOOKING_CANCELLED    # BOOKED → AVAILABLE (cancellation saga completed)
+            - ADMIN_BLOCKED        # AVAILABLE → BLOCKED
+            - ADMIN_UNBLOCKED      # BLOCKED → AVAILABLE
+          description: Machine-readable reason for the transition. Enables Notification Service to select the correct WebSocket event type.
+        bookingId:
+          type: string
+          format: uuid
+          description: |
+            Present for HOLD_CREATED (AVAILABLE→HELD) and BOOKING_COMMITTED (HELD→BOOKED).
+            Absent for HOLD_EXPIRED (Redis TTL — no application context), ADMIN_BLOCKED,
+            and ADMIN_UNBLOCKED.
+        heldUntil:
+          type: string
+          format: date-time
+          description: |
+            Present only when toState=HELD. Redis TTL expiry timestamp.
+            The browser seat map uses this to show a "held until" indicator
+            for seats currently held by other customers.
+        occurredAt:
+          type: string
+          format: date-time
+
+    SeatHoldExpiredPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - seatId
+        - eventId
+        - bookingId
+        - expiredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'seat.hold-expired'
+        seatId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+          description: |
+            Resolved from PostgreSQL seat_holds table after Redis keyspace
+            notification. Used by Notification Service to push "checkout
+            window expired" to the customer's userId room.
+        customerId:
+          type: string
+          format: uuid
+          description: Resolved from seat_holds for Notification Service routing.
+        expiredAt:
+          type: string
+          format: date-time
+
+    BulkSeatStateChangedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - eventId
+        - fromState
+        - toState
+        - transitionReason
+        - affectedSeatIds
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'seat.bulk-state-changed'
+        eventId:
+          type: string
+          format: uuid
+        fromState:
+          $ref: '#/components/schemas/SeatState'
+        toState:
+          $ref: '#/components/schemas/SeatState'
+        transitionReason:
+          type: string
+          enum:
+            - EVENT_CANCELLED       # All HELD + BOOKED → AVAILABLE
+            - VENUE_SUSPENDED       # All HELD + BOOKED → AVAILABLE
+            - ADMIN_BLOCKED         # Selected AVAILABLE → BLOCKED
+            - ADMIN_UNBLOCKED       # Selected BLOCKED → AVAILABLE
+        affectedSeatIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+          description: |
+            All seat IDs that transitioned in this batch. For large events
+            this may be thousands of entries. The Notification Service should
+            send these as a diff patch to the browser, not a full seat map reload.
+        occurredAt:
+          type: string
+          format: date-time
+
+    BlockSeatsCommandPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - commandType
+        - eventId
+        - seatIds
+        - reason
+        - issuedBy
+        - issuedAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        commandType:
+          type: string
+          const: 'block-seats'
+        eventId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+          description: Seats to transition AVAILABLE → BLOCKED. HELD or BOOKED seats are rejected.
+        reason:
+          type: string
+          description: Admin-provided reason (e.g. "wheelchair reserve — section A rows 1-3")
+          maxLength: 500
+        issuedBy:
+          type: string
+          format: uuid
+          description: Admin userId
+        issuedAt:
+          type: string
+          format: date-time
+
+    UnblockSeatsCommandPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - commandType
+        - eventId
+        - seatIds
+        - issuedBy
+        - issuedAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        commandType:
+          type: string
+          const: 'unblock-seats'
+        eventId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+        issuedBy:
+          type: string
+          format: uuid
+        issuedAt:
+          type: string
+          format: date-time
+
+    ReleaseAllEventSeatsCommandPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - commandType
+        - eventId
+        - triggerReason
+        - issuedBy
+        - issuedAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        commandType:
+          type: string
+          const: 'release-all-event-seats'
+        eventId:
+          type: string
+          format: uuid
+        triggerReason:
+          type: string
+          enum:
+            - EVENT_CANCELLED
+            - VENUE_SUSPENDED
+          description: The business event that triggered this bulk release.
+        issuedBy:
+          type: string
+          description: |
+            Service or actor that issued the command.
+            Typically "event-service" (event cancellation cascade) or
+            "admin-service" (venue suspension).
+        issuedAt:
+          type: string
+          format: date-time
