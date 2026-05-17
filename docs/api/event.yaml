@@ -1,0 +1,829 @@
+# File: event.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/event.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Event Service API
+  version: 1.0.0
+  description: |
+    Manages the event lifecycle: creation by verified Organisers, seating section
+    configuration, pricing tier management, and state transitions (DRAFT → PUBLISHED
+    → CANCELLED / POSTPONED). Publishes domain events to Kafka on state changes and
+    indexes published events to Elasticsearch.
+
+    Event status state machine:
+    DRAFT → PUBLISHED → [CANCELLED | POSTPONED]
+    POSTPONED → PUBLISHED (after new date is set)
+
+    All write endpoints require an `Idempotency-Key` header. (NFR-REL-001)
+    Organiser-scoped endpoints enforce tenant isolation — an Organiser cannot read
+    or modify another Organiser's events. (NFR-SEC-004)
+  contact:
+    name: StagePass Engineering
+  x-service-tier: T2        # 99.5% SLO — 3.6 hr/month downtime budget
+  x-repo: stagepass-event-service
+  x-traces-to:
+    - PRD §8.2 (Organiser features)
+    - PRD §7.1 (Core Domain Model)
+    - ADR-003 §3.2
+    - ADR-004 §3.3
+
+servers:
+  - url: http://localhost:8082
+    description: Local development
+  - url: https://api.stagepass.dev/events
+    description: Staging
+
+tags:
+  - name: Events
+    description: Event CRUD and lifecycle transitions
+  - name: Sections
+    description: Seating section configuration within an event
+  - name: PricingTiers
+    description: Ticket pricing tier management
+  - name: Health
+
+paths:
+
+  /events:
+    post:
+      operationId: createEvent
+      tags: [Events]
+      summary: Create a new event (Organiser only)
+      description: |
+        Creates an event in DRAFT status. The event must be associated with a
+        CONFIRMED VenueBooking. The Organiser must have KYC status VERIFIED before
+        publishing (enforced on the /publish transition, not at creation).
+        (PRD FR-O-002)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEventRequest'
+      responses:
+        '201':
+          description: Event created in DRAFT status.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: "/events/550e8400-e29b-41d4-a716-446655440000"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    get:
+      operationId: listEvents
+      tags: [Events]
+      summary: List events visible to the caller
+      description: |
+        - CUSTOMER: returns PUBLISHED events only.
+        - ORGANISER: returns their own events (all statuses).
+        - ADMIN: returns all events (all statuses).
+        Cursor-based pagination. (ADR-003 §3.2.2)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/EventStatus'
+        - name: venueId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: fromDate
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Filter events starting on or after this date (ISO-8601 date, UTC).
+        - name: toDate
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Paginated event list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /events/{eventId}:
+    get:
+      operationId: getEvent
+      tags: [Events]
+      summary: Get a single event by ID
+      description: |
+        Customers can only retrieve PUBLISHED events. Organisers can retrieve their
+        own events at any status. Admins can retrieve any event.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Event detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      operationId: updateEvent
+      tags: [Events]
+      summary: Update event metadata (Organiser only, DRAFT status only)
+      description: |
+        Event metadata (title, description, posterUrl, cancellationPolicy) can be
+        updated while in DRAFT. Once PUBLISHED, only `postponedDate` can be changed
+        (via the /postpone endpoint). Pricing tier prices cannot change after the
+        first ticket of that tier is sold. (PRD §6.2 constraints)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateEventRequest'
+      responses:
+        '200':
+          description: Event updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Event is not in DRAFT status; update rejected.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /events/{eventId}/publish:
+    post:
+      operationId: publishEvent
+      tags: [Events]
+      summary: Transition event from DRAFT to PUBLISHED (Organiser only)
+      description: |
+        Pre-conditions enforced:
+        - Organiser KYC status must be VERIFIED (PRD §6.2)
+        - VenueBooking must be CONFIRMED
+        - At least one section and one pricing tier must exist
+        - Event date must be in the future
+
+        On success, publishes `event.published` to Kafka, which triggers
+        Elasticsearch indexing (NFR-PERF-010: indexed within 30s).
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Event published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Pre-conditions not met.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /events/{eventId}/cancel:
+    post:
+      operationId: cancelEvent
+      tags: [Events]
+      summary: Cancel a PUBLISHED event (Organiser or Admin)
+      description: |
+        Transitions event to CANCELLED. Publishes `event.cancelled` to Kafka.
+        The Booking Service consumes this event and initiates the cancellation
+        saga fan-out: N booking cancellations and refunds. (PRD §7.5 — Cancellation
+        cascades; ADR-005 §3.5)
+
+        Cancellation reason is mandatory and stored for audit and Customer notification.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  maxLength: 1000
+      responses:
+        '200':
+          description: Event cancelled. Cancellation saga initiated asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Event is already cancelled.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /events/{eventId}/postpone:
+    post:
+      operationId: postponeEvent
+      tags: [Events]
+      summary: Postpone a PUBLISHED event to a new date (Organiser only)
+      description: |
+        Transitions event to POSTPONED and sets a new proposed date.
+        Publishes `event.postponed` to Kafka. Customers are notified via
+        the Notification Service. The event can be re-published once a
+        new date is confirmed.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newDate, reason]
+              properties:
+                newDate:
+                  type: string
+                  format: date-time
+                  description: Proposed new event date-time (ISO-8601 UTC).
+                reason:
+                  type: string
+                  maxLength: 1000
+      responses:
+        '200':
+          description: Event postponed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /events/{eventId}/sections:
+    get:
+      operationId: listSections
+      tags: [Sections]
+      summary: List seating sections for an event
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: List of sections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      operationId: createSection
+      tags: [Sections]
+      summary: Add a seating section to an event (Organiser only, DRAFT only)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSectionRequest'
+      responses:
+        '201':
+          description: Section created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Event is not in DRAFT status.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /events/{eventId}/pricing-tiers:
+    get:
+      operationId: listPricingTiers
+      tags: [PricingTiers]
+      summary: List pricing tiers for an event
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: List of pricing tiers.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PricingTier'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      operationId: createPricingTier
+      tags: [PricingTiers]
+      summary: Add a pricing tier to an event (Organiser only)
+      description: |
+        New tiers can be added even after publishing. However, the price of an
+        existing tier cannot be changed after the first ticket for that tier is sold.
+        (PRD §6.2 — Organiser constraints)
+
+        Price is expressed as a Money object: amount as a decimal string (ADR-004 §3.3).
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePricingTierRequest'
+      responses:
+        '201':
+          description: Pricing tier created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingTier'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Process alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      summary: Readiness probe — checks MongoDB and Kafka producer connectivity
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: Not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Client-generated UUID for idempotent writes. (NFR-REL-001)
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      description: |
+        Monetary value. Amount is always a decimal string with exactly 4 decimal
+        places (e.g. "1250.0000"). Never use a JSON number — parsers introduce
+        IEEE 754 float error. (ADR-004 §3.3, NFR-REL-010)
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string e.g. "1250.0000"
+          example: "1250.0000"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          description: ISO-4217 currency code.
+          example: "INR"
+
+    EventStatus:
+      type: string
+      enum: [DRAFT, PUBLISHED, CANCELLED, POSTPONED]
+
+    CancellationPolicy:
+      type: object
+      description: |
+        Organiser-defined refund brackets. Immutable after the first ticket is sold.
+        (PRD §6.2 constraint)
+      properties:
+        brackets:
+          type: array
+          items:
+            type: object
+            required: [hoursBeforeEvent, refundPercentage]
+            properties:
+              hoursBeforeEvent:
+                type: integer
+                description: If cancelled more than this many hours before the event...
+              refundPercentage:
+                type: integer
+                minimum: 0
+                maximum: 100
+                description: ...the Customer receives this percentage as a refund.
+
+    CreateEventRequest:
+      type: object
+      required: [venueBookingId, title, eventDate, cancellationPolicy]
+      properties:
+        venueBookingId:
+          type: string
+          format: uuid
+          description: Must reference a CONFIRMED VenueBooking owned by this Organiser.
+        title:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+        eventDate:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC. Must be in the future.
+        doorOpenTime:
+          type: string
+          format: date-time
+        posterUrl:
+          type: string
+          format: uri
+          description: MinIO object URL. Uploaded separately via object storage.
+        categoryIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        cancellationPolicy:
+          $ref: '#/components/schemas/CancellationPolicy'
+        surgeRules:
+          type: object
+          description: Optional surge pricing rules. Demand prediction feeds into this.
+          properties:
+            enabled:
+              type: boolean
+            maxMultiplier:
+              type: number
+              description: Maximum surge multiplier (platform-configured ceiling applies).
+
+    UpdateEventRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 5000
+        posterUrl:
+          type: string
+          format: uri
+        cancellationPolicy:
+          $ref: '#/components/schemas/CancellationPolicy'
+
+    Event:
+      type: object
+      required: [eventId, venueBookingId, organiserId, title, status, eventDate, createdAt]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        venueBookingId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          $ref: '#/components/schemas/EventStatus'
+        eventDate:
+          type: string
+          format: date-time
+        doorOpenTime:
+          type: string
+          format: date-time
+        postponedDate:
+          type: string
+          format: date-time
+          nullable: true
+        posterUrl:
+          type: string
+          format: uri
+        categoryIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        cancellationPolicy:
+          $ref: '#/components/schemas/CancellationPolicy'
+        totalCapacity:
+          type: integer
+        publishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancellationReason:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    EventPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        nextCursor:
+          type: string
+          nullable: true
+        prevCursor:
+          type: string
+          nullable: true
+
+    CreateSectionRequest:
+      type: object
+      required: [name, layoutSectionRef, pricingTierId]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          description: Human-readable section name e.g. "North Stand".
+        layoutSectionRef:
+          type: string
+          description: Reference to the section identifier in the Venue SeatingLayout.
+        pricingTierId:
+          type: string
+          format: uuid
+        colour:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          description: Hex colour for seat map display.
+
+    Section:
+      type: object
+      required: [sectionId, eventId, name, layoutSectionRef, pricingTierId]
+      properties:
+        sectionId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        layoutSectionRef:
+          type: string
+        pricingTierId:
+          type: string
+          format: uuid
+        colour:
+          type: string
+
+    CreatePricingTierRequest:
+      type: object
+      required: [name, price]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          description: e.g. "General Admission", "Platinum".
+        price:
+          $ref: '#/components/schemas/Money'
+        capacity:
+          type: integer
+          description: Maximum seats at this tier. If omitted, derived from assigned sections.
+
+    PricingTier:
+      type: object
+      required: [tierId, eventId, name, price, soldCount]
+      properties:
+        tierId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price:
+          $ref: '#/components/schemas/Money'
+        capacity:
+          type: integer
+          nullable: true
+        soldCount:
+          type: integer
+          description: Tickets sold at this tier. Price cannot change once soldCount > 0.
+        createdAt:
+          type: string
+          format: date-time
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or tenant isolation violation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,514 @@
+# File: disbursement.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/disbursement.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Disbursement Service API
+  version: 1.0.0
+  description: |
+    Manages the escrow ledger and fund disbursement lifecycle. This service owns the
+    platform's financial record of truth. The ledger is append-only and immutable —
+    no record is ever updated or deleted. (ADR-008)
+
+    All revenue split amounts are computed once at booking time by the Booking Service
+    and written as immutable RevenueSplit entries. This service stores them as ledger
+    entries and disburses to Venues and Organisers after event completion.
+
+    Disbursement state machine:
+    HELD → PENDING_DISBURSEMENT → DISBURSED
+         → REFUNDED_PARTIAL (some tickets refunded pre-event)
+         → REFUNDED_FULL (all tickets refunded; event cancelled)
+
+    Disbursement is triggered by the `event.completed` Kafka event.
+    Refunds adjust the disbursable amount but never modify existing ledger entries —
+    a new compensating entry is created. (NFR-REL-012)
+
+    All amounts: Money wire format (string, 4dp). (ADR-004 §3.3, NFR-REL-010)
+    All write endpoints: SERIALIZABLE isolation on PostgreSQL. (NFR-REL-008)
+  x-service-tier: T1
+  x-repo: stagepass-disbursement-service
+  x-traces-to:
+    - ADR-008 (Revenue split and disbursement model)
+    - NFR-REL-008, NFR-REL-010, NFR-REL-012
+    - PRD §7.3 (Revenue split model)
+    - PRD §8.2 FR-O-006 (Organiser disbursement visibility)
+    - PRD §8.3 FR-V-004 (Venue revenue visibility)
+
+servers:
+  - url: http://localhost:8086
+    description: Local development
+  - url: https://api.stagepass.dev/disbursements
+    description: Staging
+
+tags:
+  - name: DisbursementSchedule
+    description: Per-event disbursement schedule and status
+  - name: LedgerEntries
+    description: Immutable financial ledger (append-only)
+  - name: EscrowBalances
+    description: Current escrow balances per Organiser and Venue
+  - name: Health
+
+paths:
+
+  /disbursements:
+    get:
+      operationId: listDisbursements
+      tags: [DisbursementSchedule]
+      summary: List disbursement schedules
+      description: |
+        - ORGANISER: their events' disbursement schedules.
+        - VENUE actor: their venues' disbursement schedules.
+        - ADMIN: all disbursement schedules with full financial detail.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: eventId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/DisbursementStatus'
+        - name: fromDate
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: toDate
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Paginated disbursement schedule list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisbursementPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /disbursements/{disbursementId}:
+    get:
+      operationId: getDisbursement
+      tags: [DisbursementSchedule]
+      summary: Get a single disbursement schedule by ID
+      parameters:
+        - $ref: '#/components/parameters/DisbursementId'
+      responses:
+        '200':
+          description: Disbursement schedule detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisbursementSchedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /disbursements/{disbursementId}/trigger:
+    post:
+      operationId: triggerDisbursement
+      tags: [DisbursementSchedule]
+      summary: Manually trigger disbursement (Admin only)
+      description: |
+        In normal operation, disbursement is triggered automatically when the
+        `event.completed` Kafka event is consumed. This endpoint allows Admin
+        to manually trigger disbursement for a specific event (e.g., after a
+        delay or exception). All Admin actions are logged. (PRD §6.4)
+
+        Idempotent: triggering an already-disbursed schedule returns success.
+      parameters:
+        - $ref: '#/components/parameters/DisbursementId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '202':
+          description: Disbursement triggered. Bank transfers initiated asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisbursementSchedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Disbursement already completed or not in a triggerable state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /escrow-balances:
+    get:
+      operationId: listEscrowBalances
+      tags: [EscrowBalances]
+      summary: List current escrow balances
+      description: |
+        Returns the currently held (undisbursed) escrow amounts.
+        - ORGANISER: their own pending escrow.
+        - VENUE actor: their own pending escrow.
+        - ADMIN: all escrow balances with platform fee breakdown.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated escrow balance list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EscrowBalancePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /ledger-entries:
+    get:
+      operationId: listLedgerEntries
+      tags: [LedgerEntries]
+      summary: List immutable ledger entries (Admin only)
+      description: |
+        Append-only financial ledger. Every revenue split, refund adjustment, and
+        disbursement is recorded here as an immutable entry.
+        No entry is ever updated or deleted — compensations create new entries.
+        (ADR-008, NFR-REL-012)
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: eventId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: bookingId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: entryType
+          in: query
+          schema:
+            $ref: '#/components/schemas/LedgerEntryType'
+      responses:
+        '200':
+          description: Paginated ledger entry list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerEntryPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    DisbursementId:
+      name: disbursementId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string. (ADR-004 §3.3)
+          example: "1250.0000"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          example: "INR"
+
+    DisbursementStatus:
+      type: string
+      enum: [HELD, PENDING_DISBURSEMENT, DISBURSED, REFUNDED_PARTIAL, REFUNDED_FULL]
+
+    LedgerEntryType:
+      type: string
+      enum:
+        - REVENUE_SPLIT          # Created at booking confirmation
+        - REFUND_ADJUSTMENT      # Created on booking cancellation (compensating entry)
+        - PLATFORM_FEE_CREDIT    # Platform fee credited to platform account
+        - VENUE_DISBURSEMENT     # Venue share transferred
+        - ORGANISER_DISBURSEMENT # Organiser share transferred
+
+    DisbursementSchedule:
+      type: object
+      required: [disbursementId, eventId, status, venueShare, organiserShare, platformFee, grossRevenue]
+      properties:
+        disbursementId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/DisbursementStatus'
+        grossRevenue:
+          $ref: '#/components/schemas/Money'
+          description: Total revenue collected across all confirmed bookings for this event.
+        platformFee:
+          $ref: '#/components/schemas/Money'
+        venueShare:
+          $ref: '#/components/schemas/Money'
+        organiserShare:
+          $ref: '#/components/schemas/Money'
+        refundedAmount:
+          $ref: '#/components/schemas/Money'
+          description: Total refunded to date (compensating entries).
+        netDisbursableVenue:
+          $ref: '#/components/schemas/Money'
+        netDisbursableOrganiser:
+          $ref: '#/components/schemas/Money'
+        eventCompletedAt:
+          type: string
+          format: date-time
+          nullable: true
+        disbursedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    DisbursementPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DisbursementSchedule'
+        nextCursor:
+          type: string
+          nullable: true
+
+    EscrowBalance:
+      type: object
+      required: [partyId, partyType, heldAmount, eventCount]
+      properties:
+        partyId:
+          type: string
+          format: uuid
+          description: organiserId or venueId.
+        partyType:
+          type: string
+          enum: [ORGANISER, VENUE]
+        heldAmount:
+          $ref: '#/components/schemas/Money'
+          description: Total currently held in escrow pending disbursement.
+        eventCount:
+          type: integer
+          description: Number of events contributing to this escrow balance.
+
+    EscrowBalancePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EscrowBalance'
+        nextCursor:
+          type: string
+          nullable: true
+
+    LedgerEntry:
+      type: object
+      required: [entryId, entryType, bookingId, eventId, amount, createdAt]
+      description: |
+        Immutable append-only record. No field is ever changed after creation.
+        Compensating entries (refund adjustments) reference the original entry
+        via correlationEntryId.
+      properties:
+        entryId:
+          type: string
+          format: uuid
+        entryType:
+          $ref: '#/components/schemas/LedgerEntryType'
+        bookingId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        partyId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The party credited (organiserId, venueId, or null for PLATFORM_FEE).
+        partyType:
+          type: string
+          enum: [ORGANISER, VENUE, PLATFORM]
+          nullable: true
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Positive for credit entries, negative for refund adjustments.
+        correlationEntryId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The original REVENUE_SPLIT entry this compensates.
+        createdAt:
+          type: string
+          format: date-time
+          description: Immutable. Set at creation, never updated.
+
+    LedgerEntryPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LedgerEntry'
+        nextCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or tenant isolation violation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

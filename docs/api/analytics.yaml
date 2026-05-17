@@ -1,0 +1,492 @@
+# File: analytics.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/analytics.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Analytics Service API
+  version: 1.0.0
+  description: |
+    OLAP analytics over ClickHouse. Serves time-series metrics on ticket sales,
+    revenue, attendance trends, and platform health. All data is derived from
+    Kafka events consumed by this service — no write path through this API.
+
+    Tenant isolation: Organisers can only see analytics for their own events;
+    Venue actors can only see utilisation for their own venues. (NFR-SEC-004)
+
+    Data freshness: ClickHouse aggregations run on a 60-second refresh cycle.
+    Grafana business metrics dashboards are also fed from ClickHouse. (NFR-OBS-005)
+
+    This service exposes read-only endpoints only. There is no write path.
+    Degradation: dashboards show last-known metrics during downtime. No
+    operational data is lost — the Kafka backlog is replayed on recovery.
+  x-service-tier: T3
+  x-repo: stagepass-analytics-service
+  x-traces-to:
+    - PRD §8.2 FR-O-003 (Organiser live sales dashboard)
+    - PRD §8.2 FR-O-006 (Revenue summary)
+    - PRD §8.3 FR-V-004 (Venue utilisation analytics)
+    - PRD §8.4 FR-A-005 (Admin platform analytics)
+    - NFR-OBS-005 (Business metrics in Grafana refreshed every 60s)
+
+servers:
+  - url: http://localhost:8093
+    description: Local development
+  - url: https://api.stagepass.dev/analytics
+    description: Staging
+
+tags:
+  - name: EventAnalytics
+    description: Per-event sales and attendance analytics
+  - name: OrganiserAnalytics
+    description: Organiser-level revenue and performance
+  - name: VenueAnalytics
+    description: Venue utilisation analytics
+  - name: PlatformAnalytics
+    description: Platform-wide metrics (Admin only)
+  - name: Health
+
+paths:
+
+  /analytics/events/{eventId}/sales:
+    get:
+      operationId: getEventSalesAnalytics
+      tags: [EventAnalytics]
+      summary: Get ticket sales velocity and revenue for an event
+      description: |
+        Returns time-series data: tickets sold per time bucket and cumulative
+        revenue. Used by Organiser live dashboard. (PRD FR-O-003)
+
+        Access: ORGANISER (own events), ADMIN (all events).
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/TimeBucket'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+      responses:
+        '200':
+          description: Time-series sales data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventSalesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /analytics/events/{eventId}/attendance:
+    get:
+      operationId: getEventAttendanceAnalytics
+      tags: [EventAnalytics]
+      summary: Get attendance time-series for a live or completed event
+      description: |
+        Check-in rate over time (actual attendees vs expected). Updated from
+        `checkin.recorded` Kafka events. Used by Organiser and Venue staff
+        during live events. (PRD FR-V-004, FR-O-004)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/TimeBucket'
+      responses:
+        '200':
+          description: Attendance time-series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventAttendanceResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /analytics/organisers/{organiserId}/revenue:
+    get:
+      operationId: getOrganiserRevenue
+      tags: [OrganiserAnalytics]
+      summary: Get revenue summary for an Organiser across all their events
+      parameters:
+        - $ref: '#/components/parameters/OrganiserId'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+      responses:
+        '200':
+          description: Organiser revenue summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganiserRevenueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/venues/{venueId}/utilisation:
+    get:
+      operationId: getVenueUtilisation
+      tags: [VenueAnalytics]
+      summary: Get utilisation analytics for a venue
+      description: |
+        Events hosted per month, average seat occupancy rate, revenue per event.
+        Access: VENUE actor (own venue), ADMIN (all venues). (PRD FR-V-004 AC-2)
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+      responses:
+        '200':
+          description: Venue utilisation metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueUtilisationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/platform/revenue:
+    get:
+      operationId: getPlatformRevenue
+      tags: [PlatformAnalytics]
+      summary: Get platform-wide revenue time-series (Admin only)
+      parameters:
+        - $ref: '#/components/parameters/TimeBucket'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+      responses:
+        '200':
+          description: Platform GMV and fee time-series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformRevenueResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/platform/bookings:
+    get:
+      operationId: getPlatformBookings
+      tags: [PlatformAnalytics]
+      summary: Get platform-wide booking throughput metrics (Admin only)
+      description: Bookings per minute, saga success/failure rates, refund volumes.
+      parameters:
+        - $ref: '#/components/parameters/TimeBucket'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+      responses:
+        '200':
+          description: Platform booking throughput.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformBookingResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks ClickHouse connectivity and Kafka consumer group.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrganiserId:
+      name: organiserId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    VenueId:
+      name: venueId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TimeBucket:
+      name: bucket
+      in: query
+      required: false
+      description: Time bucket for aggregation. Default 1h.
+      schema:
+        type: string
+        enum: [5m, 15m, 1h, 1d]
+        default: 1h
+    FromTs:
+      name: from
+      in: query
+      required: false
+      description: Start of time range (ISO-8601 UTC).
+      schema:
+        type: string
+        format: date-time
+    ToTs:
+      name: to
+      in: query
+      required: false
+      description: End of time range (ISO-8601 UTC). Defaults to now.
+      schema:
+        type: string
+        format: date-time
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string. (ADR-004 §3.3)
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+
+    TimeSeriesPoint:
+      type: object
+      required: [ts, value]
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: Bucket start timestamp (UTC).
+        value:
+          type: number
+          format: double
+
+    MoneyTimeSeriesPoint:
+      type: object
+      required: [ts, amount, currency]
+      properties:
+        ts:
+          type: string
+          format: date-time
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+        currency:
+          type: string
+
+    EventSalesResponse:
+      type: object
+      required: [eventId, ticketsSoldSeries, revenueSeries, totalSold, totalRevenue]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        ticketsSoldSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSeriesPoint'
+        revenueSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MoneyTimeSeriesPoint'
+        totalSold:
+          type: integer
+        totalRevenue:
+          $ref: '#/components/schemas/Money'
+        refundedCount:
+          type: integer
+        refundedAmount:
+          $ref: '#/components/schemas/Money'
+
+    EventAttendanceResponse:
+      type: object
+      required: [eventId, checkInSeries, peakCheckInsPerBucket, totalExpected, totalCheckedIn]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        checkInSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSeriesPoint'
+        peakCheckInsPerBucket:
+          type: integer
+        totalExpected:
+          type: integer
+        totalCheckedIn:
+          type: integer
+        checkInRate:
+          type: number
+          format: double
+
+    OrganiserRevenueResponse:
+      type: object
+      required: [organiserId, totalGrossRevenue, totalNetRevenue, eventCount, revenueSeries]
+      properties:
+        organiserId:
+          type: string
+          format: uuid
+        totalGrossRevenue:
+          $ref: '#/components/schemas/Money'
+        totalNetRevenue:
+          $ref: '#/components/schemas/Money'
+          description: After platform fee deduction.
+        totalRefundedAmount:
+          $ref: '#/components/schemas/Money'
+        eventCount:
+          type: integer
+        revenueSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MoneyTimeSeriesPoint'
+
+    VenueUtilisationResponse:
+      type: object
+      required: [venueId, eventsHosted, avgOccupancyRate, revenueSeries]
+      properties:
+        venueId:
+          type: string
+          format: uuid
+        eventsHosted:
+          type: integer
+        avgOccupancyRate:
+          type: number
+          format: double
+          description: 0.0 – 1.0
+        totalRevenueShare:
+          $ref: '#/components/schemas/Money'
+        revenueSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MoneyTimeSeriesPoint'
+
+    PlatformRevenueResponse:
+      type: object
+      required: [totalGmv, totalPlatformFee, gmvSeries, feeSeries]
+      properties:
+        totalGmv:
+          $ref: '#/components/schemas/Money'
+        totalPlatformFee:
+          $ref: '#/components/schemas/Money'
+        gmvSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MoneyTimeSeriesPoint'
+        feeSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MoneyTimeSeriesPoint'
+
+    PlatformBookingResponse:
+      type: object
+      required: [totalBookings, successRate, bookingsPerMinSeries]
+      properties:
+        totalBookings:
+          type: integer
+        confirmedBookings:
+          type: integer
+        failedBookings:
+          type: integer
+        cancelledBookings:
+          type: integer
+        successRate:
+          type: number
+          format: double
+        bookingsPerMinSeries:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeSeriesPoint'
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or tenant isolation violation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

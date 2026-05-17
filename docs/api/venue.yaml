@@ -1,0 +1,976 @@
+# File: venue.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/venue.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Venue Service API
+  version: 1.0.0
+  description: |
+    Manages Venue profiles, seating layout versioning, Organiser booking requests
+    (VenueBooking lifecycle), booking calendar, unavailability windows, and
+    Venue-scoped revenue and utilisation views.
+
+    VenueBooking state machine:
+    REQUESTED → ACCEPTED → CONFIRMED (when Organiser creates Event)
+                         → CANCELLED
+                REJECTED
+
+    Seating layouts are versioned. Once seats from a layout version are sold for
+    any event, that version is immutable. New events always use the latest version.
+    (PRD FR-V-002)
+
+    Tenant isolation: a Venue actor can only read/write their own Venue resources.
+    Cross-tenant access returns 403 and logs a security event. (NFR-SEC-004)
+  x-service-tier: T2
+  x-repo: stagepass-venue-service
+  x-traces-to:
+    - PRD §6.3 (Venue actor)
+    - PRD §8.3 (Venue features)
+    - ADR-003 §3.2.2
+
+servers:
+  - url: http://localhost:8083
+    description: Local development
+  - url: https://api.stagepass.dev/venues
+    description: Staging
+
+tags:
+  - name: Venues
+  - name: SeatingLayouts
+  - name: VenueBookings
+  - name: Unavailability
+  - name: Revenue
+  - name: Health
+
+paths:
+
+  /venues:
+    post:
+      operationId: createVenue
+      tags: [Venues]
+      summary: Register a new Venue (Venue actor only)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVenueRequest'
+      responses:
+        '201':
+          description: Venue created.
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    get:
+      operationId: listVenues
+      tags: [Venues]
+      summary: List venues
+      description: |
+        - ORGANISER / CUSTOMER: returns active, publicly listed venues (for discovery).
+        - VENUE actor: returns only their own venues.
+        - ADMIN: returns all venues.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/VenueStatus'
+      responses:
+        '200':
+          description: Paginated venue list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenuePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /venues/{venueId}:
+    get:
+      operationId: getVenue
+      tags: [Venues]
+      summary: Get a single venue
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      responses:
+        '200':
+          description: Venue detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      operationId: updateVenue
+      tags: [Venues]
+      summary: Update venue profile (Venue actor — own venue only)
+      description: Profile fields (photos, facilities, contact) can be updated at any time. Seating layout changes require a new layout version via /layouts.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVenueRequest'
+      responses:
+        '200':
+          description: Venue updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /venues/{venueId}/layouts:
+    get:
+      operationId: listLayouts
+      tags: [SeatingLayouts]
+      summary: List all seating layout versions for a venue
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      responses:
+        '200':
+          description: List of layout versions, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SeatingLayoutSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      operationId: createLayout
+      tags: [SeatingLayouts]
+      summary: Create a new seating layout version (Venue actor — own venue only)
+      description: |
+        Creates a new layout version. All new events are associated with the
+        latest version. In-flight events retain their version (immutable once tickets
+        are sold for that version). (PRD FR-V-002)
+
+        Stadium-scale layouts support up to 50,000 seats. The SVG coordinate system
+        is normalised to a 1000×1000 viewport.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLayoutRequest'
+      responses:
+        '201':
+          description: Layout version created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatingLayout'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /venues/{venueId}/layouts/{layoutId}:
+    get:
+      operationId: getLayout
+      tags: [SeatingLayouts]
+      summary: Get full seating layout detail
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/LayoutId'
+      responses:
+        '200':
+          description: Full layout including sections, rows, and seats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatingLayout'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /venues/{venueId}/unavailability:
+    post:
+      operationId: addUnavailability
+      tags: [Unavailability]
+      summary: Block a date range as unavailable (Venue actor — own venue only)
+      description: |
+        Prevents new Organiser booking requests for the blocked range.
+        Does not affect already-confirmed bookings within the range.
+        (PRD FR-V-003 AC-6)
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnavailabilityRequest'
+      responses:
+        '201':
+          description: Unavailability window created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnavailabilityWindow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /venues/{venueId}/revenue:
+    get:
+      operationId: getVenueRevenue
+      tags: [Revenue]
+      summary: Get revenue summary for a venue (Venue actor — own venue only)
+      description: |
+        Returns per-event revenue share amounts, escrow status, and disbursement
+        history. Revenue share percentages are negotiated at VenueBooking time and
+        stored as part of the VenueBooking record. (PRD FR-V-004)
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated revenue summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueRevenuePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ─── VenueBookings ────────────────────────────────────────────────────
+
+  /venue-bookings:
+    post:
+      operationId: requestVenueBooking
+      tags: [VenueBookings]
+      summary: Submit a venue booking request (Organiser only)
+      description: |
+        An Organiser submits a booking request for a specific venue, date, and
+        configuration. The Venue must accept before an Event can be created.
+        (PRD FR-O-001)
+
+        The `venueRevenueSharePercentage` field records the agreed share at request
+        time. It is immutable after the VenueBooking reaches ACCEPTED state.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVenueBookingRequest'
+      responses:
+        '201':
+          description: Booking request submitted. Status is REQUESTED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueBooking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Venue unavailable for the requested dates.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    get:
+      operationId: listVenueBookings
+      tags: [VenueBookings]
+      summary: List venue booking requests
+      description: |
+        - ORGANISER: their own requests.
+        - VENUE actor: requests to their venues.
+        - ADMIN: all requests.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/VenueBookingStatus'
+        - name: venueId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Paginated booking request list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueBookingPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /venue-bookings/{vbId}:
+    get:
+      operationId: getVenueBooking
+      tags: [VenueBookings]
+      summary: Get a single venue booking request
+      parameters:
+        - $ref: '#/components/parameters/VenueBookingId'
+      responses:
+        '200':
+          description: Venue booking detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueBooking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /venue-bookings/{vbId}/accept:
+    post:
+      operationId: acceptVenueBooking
+      tags: [VenueBookings]
+      summary: Accept a venue booking request (Venue actor — own venue only)
+      description: |
+        Transitions VenueBooking from REQUESTED to ACCEPTED.
+        An accepted booking is visible to the Organiser who can now create
+        an Event. The Venue's booking calendar is updated. (PRD FR-V-003 AC-3)
+      parameters:
+        - $ref: '#/components/parameters/VenueBookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Booking accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueBooking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: VenueBooking is not in REQUESTED status.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /venue-bookings/{vbId}/reject:
+    post:
+      operationId: rejectVenueBooking
+      tags: [VenueBookings]
+      summary: Reject a venue booking request (Venue actor — own venue only)
+      description: |
+        Transitions VenueBooking to REJECTED. A rejection reason is mandatory.
+        The Organiser is notified via Kafka → Notification Service. (PRD FR-V-003 AC-3)
+      parameters:
+        - $ref: '#/components/parameters/VenueBookingId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: Booking rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueBooking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    VenueId:
+      name: venueId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LayoutId:
+      name: layoutId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    VenueBookingId:
+      name: vbId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: NUMERIC(19,4) decimal string e.g. "1250.0000". (ADR-004 §3.3)
+          example: "1250.0000"
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          example: "INR"
+
+    VenueStatus:
+      type: string
+      enum: [ACTIVE, SUSPENDED, PENDING_KYC]
+
+    VenueBookingStatus:
+      type: string
+      enum: [REQUESTED, ACCEPTED, CONFIRMED, REJECTED, CANCELLED]
+
+    CreateVenueRequest:
+      type: object
+      required: [name, city, address, totalCapacity]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        city:
+          type: string
+          maxLength: 100
+        address:
+          type: string
+          maxLength: 500
+        lat:
+          type: number
+          format: double
+        lng:
+          type: number
+          format: double
+        totalCapacity:
+          type: integer
+          minimum: 1
+        facilities:
+          type: array
+          items:
+            type: string
+        photoUrls:
+          type: array
+          items:
+            type: string
+            format: uri
+
+    UpdateVenueRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        city:
+          type: string
+        address:
+          type: string
+        facilities:
+          type: array
+          items:
+            type: string
+        photoUrls:
+          type: array
+          items:
+            type: string
+            format: uri
+
+    Venue:
+      type: object
+      required: [venueId, ownerId, name, city, status, totalCapacity, createdAt]
+      properties:
+        venueId:
+          type: string
+          format: uuid
+        ownerId:
+          type: string
+          format: uuid
+          description: userId of the Venue actor who owns this venue.
+        name:
+          type: string
+        city:
+          type: string
+        address:
+          type: string
+        lat:
+          type: number
+        lng:
+          type: number
+        status:
+          $ref: '#/components/schemas/VenueStatus'
+        totalCapacity:
+          type: integer
+        facilities:
+          type: array
+          items:
+            type: string
+        photoUrls:
+          type: array
+          items:
+            type: string
+        latestLayoutId:
+          type: string
+          format: uuid
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    VenuePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Venue'
+        nextCursor:
+          type: string
+          nullable: true
+        prevCursor:
+          type: string
+          nullable: true
+
+    SeatType:
+      type: string
+      enum: [STANDARD, PREMIUM, ACCESSIBLE]
+
+    Seat:
+      type: object
+      required: [seatId, row, number, type, svgX, svgY]
+      properties:
+        seatId:
+          type: string
+          description: Unique seat identifier within the venue (e.g. "N-A-12B").
+        row:
+          type: string
+        number:
+          type: string
+        type:
+          $ref: '#/components/schemas/SeatType'
+        svgX:
+          type: number
+          description: X coordinate in normalised 1000×1000 SVG viewport.
+        svgY:
+          type: number
+
+    Row:
+      type: object
+      required: [rowId, label, seats]
+      properties:
+        rowId:
+          type: string
+        label:
+          type: string
+        seats:
+          type: array
+          items:
+            $ref: '#/components/schemas/Seat'
+
+    LayoutSection:
+      type: object
+      required: [sectionRef, name, rows]
+      properties:
+        sectionRef:
+          type: string
+          description: Stable reference identifier used by Event Service sections.
+        name:
+          type: string
+        colour:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/Row'
+
+    CreateLayoutRequest:
+      type: object
+      required: [sections]
+      properties:
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/LayoutSection'
+          minItems: 1
+
+    SeatingLayoutSummary:
+      type: object
+      required: [layoutId, venueId, version, totalSeats, createdAt, immutable]
+      properties:
+        layoutId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          description: Auto-incremented version number.
+        totalSeats:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        immutable:
+          type: boolean
+          description: True if at least one ticket has been sold against this layout version.
+
+    SeatingLayout:
+      allOf:
+        - $ref: '#/components/schemas/SeatingLayoutSummary'
+        - type: object
+          properties:
+            sections:
+              type: array
+              items:
+                $ref: '#/components/schemas/LayoutSection'
+
+    UnavailabilityRequest:
+      type: object
+      required: [fromDate, toDate, reason]
+      properties:
+        fromDate:
+          type: string
+          format: date
+        toDate:
+          type: string
+          format: date
+        reason:
+          type: string
+          maxLength: 500
+
+    UnavailabilityWindow:
+      type: object
+      required: [windowId, venueId, fromDate, toDate]
+      properties:
+        windowId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        fromDate:
+          type: string
+          format: date
+        toDate:
+          type: string
+          format: date
+        reason:
+          type: string
+
+    VenueRevenueSummary:
+      type: object
+      required: [eventId, eventTitle, revenueShare, escrowStatus, eventDate]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        eventTitle:
+          type: string
+        eventDate:
+          type: string
+          format: date-time
+        revenueShare:
+          $ref: '#/components/schemas/Money'
+        venueSharePercentage:
+          type: string
+          description: Negotiated share percentage (stored as NUMERIC(19,4)).
+          example: "30.0000"
+        escrowStatus:
+          type: string
+          enum: [HELD, DISBURSED, REFUNDED_PARTIAL, REFUNDED_FULL]
+        disbursedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    VenueRevenuePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VenueRevenueSummary'
+        nextCursor:
+          type: string
+          nullable: true
+
+    CreateVenueBookingRequest:
+      type: object
+      required: [venueId, fromDate, toDate, expectedAttendance, venueRevenueSharePercentage]
+      properties:
+        venueId:
+          type: string
+          format: uuid
+        fromDate:
+          type: string
+          format: date-time
+          description: Requested booking start (ISO-8601 UTC).
+        toDate:
+          type: string
+          format: date-time
+        expectedAttendance:
+          type: integer
+          minimum: 1
+        eventType:
+          type: string
+          maxLength: 100
+          description: e.g. "Concert", "Comedy Show", "Cricket".
+        message:
+          type: string
+          maxLength: 2000
+          description: Optional message from Organiser to Venue.
+        venueRevenueSharePercentage:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: |
+            Agreed revenue share percentage for the Venue (e.g. "30.0000").
+            Immutable once VenueBooking reaches ACCEPTED. (PRD FR-V-004 AC-3)
+          example: "30.0000"
+
+    VenueBooking:
+      type: object
+      required: [vbId, venueId, organiserId, fromDate, toDate, status, venueRevenueSharePercentage, createdAt]
+      properties:
+        vbId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        fromDate:
+          type: string
+          format: date-time
+        toDate:
+          type: string
+          format: date-time
+        expectedAttendance:
+          type: integer
+        eventType:
+          type: string
+        message:
+          type: string
+        status:
+          $ref: '#/components/schemas/VenueBookingStatus'
+        venueRevenueSharePercentage:
+          type: string
+          description: NUMERIC(19,4) decimal string. Immutable after ACCEPTED.
+          example: "30.0000"
+        rejectionReason:
+          type: string
+          nullable: true
+        eventId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set when the Organiser creates an Event against this booking.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    VenueBookingPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VenueBooking'
+        nextCursor:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role or tenant isolation violation. (NFR-SEC-004)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Validation failure.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

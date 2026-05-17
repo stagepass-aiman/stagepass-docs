@@ -1,0 +1,369 @@
+# File: chatbot.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/chatbot.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Chatbot Service API
+  version: 1.0.0
+  description: |
+    RAG-powered chatbot over the live event catalog and Customer booking context.
+    Uses LangChain + Qdrant for retrieval and an LLM for response generation.
+    Conversation memory is stored in Redis (per sessionId).
+
+    The Chatbot Service makes direct REST calls to Event Service and Booking Service,
+    forwarding the Customer's JWT for RBAC-aware context retrieval. (ADR-003 §3.2.1)
+
+    Performance target: first-token latency p99 < 2500ms. (NFR-PERF-009)
+    Responses are streamed (Server-Sent Events) for perceived performance.
+
+    Cross-session memory requires DPDP consent model (OQ-08 — deferred to Phase 5).
+    In v1.0: session memory is per-session only, cleared on session deletion.
+
+    Degradation: if the service is unavailable, the chatbot widget is hidden.
+    Core event pages remain fully functional. (T3 fail-open)
+  x-service-tier: T3
+  x-repo: stagepass-chatbot-service
+  x-traces-to:
+    - PRD §8.5 (AI features — RAG chatbot)
+    - PRD §8.1 FR-C-008 (Customer chatbot interaction)
+    - ADR-003 §3.2.1 (REST — Chatbot → Event / Booking)
+    - NFR-PERF-009 (first-token latency p99 < 2500ms)
+
+servers:
+  - url: http://localhost:8092
+    description: Local development
+  - url: https://api.stagepass.dev/chat
+    description: Staging
+
+tags:
+  - name: Sessions
+    description: Chatbot session lifecycle
+  - name: Messages
+    description: Sending messages and receiving streamed responses
+  - name: Health
+
+paths:
+
+  /chat/sessions:
+    post:
+      operationId: createSession
+      tags: [Sessions]
+      summary: Create a new chatbot session (Customer only)
+      description: |
+        Creates a new conversation session. The sessionId is used for all subsequent
+        messages. Session memory is stored in Redis with a TTL (default: 2 hours).
+        After TTL expiry, the session is automatically deleted; the Customer must
+        start a new session.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                eventId:
+                  type: string
+                  format: uuid
+                  description: |
+                    Optional event context. If provided, the chatbot is pre-grounded
+                    with this event's details (RAG retrieval at session creation).
+      responses:
+        '201':
+          description: Session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /chat/sessions/{sessionId}/messages:
+    post:
+      operationId: sendMessage
+      tags: [Messages]
+      summary: Send a message and receive a streamed response
+      description: |
+        Sends a Customer message. The response is streamed via Server-Sent Events
+        (text/event-stream). Each SSE event contains a text delta. The final event
+        contains `[DONE]` and metadata.
+
+        The RAG pipeline:
+        1. Embed the Customer query (Qdrant vector search)
+        2. Retrieve top-K relevant event catalog chunks
+        3. Optionally fetch live booking context (REST → Booking Service with Customer JWT)
+        4. Generate LLM response with retrieved context
+        5. Stream tokens to the client
+
+        First-token latency target: p99 < 2500ms. (NFR-PERF-009)
+
+        Content moderation: off-topic or harmful queries receive a polite redirect
+        without LLM call.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        '200':
+          description: |
+            Streamed LLM response (Server-Sent Events).
+            Each event: `data: {"delta": "text chunk"}`
+            Final event: `data: {"delta": "", "done": true, "messageId": "<uuid>", "sources": [...]}`
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream of text deltas.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Session not found or expired.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /chat/sessions/{sessionId}/history:
+    get:
+      operationId: getSessionHistory
+      tags: [Sessions]
+      summary: Get conversation history for a session
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Number of most recent messages to return.
+      responses:
+        '200':
+          description: Conversation history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionHistory'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Session not found or expired.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /chat/sessions/{sessionId}:
+    delete:
+      operationId: deleteSession
+      tags: [Sessions]
+      summary: Delete a chatbot session and its conversation memory
+      description: |
+        Deletes the Redis conversation memory for this session. Used when the
+        Customer navigates away or explicitly ends the chat. Idempotent.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204':
+          description: Session deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks Qdrant, Redis (conversation memory), and LLM API reachability.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    ChatSession:
+      type: object
+      required: [sessionId, customerId, createdAt, expiresAt]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        contextEventId:
+          type: string
+          format: uuid
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          description: Redis TTL expiry. Session memory is cleared after this time.
+
+    SendMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: The Customer's message text.
+
+    MessageRole:
+      type: string
+      enum: [USER, ASSISTANT]
+
+    ChatMessage:
+      type: object
+      required: [messageId, role, content, createdAt]
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/MessageRole'
+        content:
+          type: string
+        sources:
+          type: array
+          description: RAG source citations (only on ASSISTANT messages).
+          items:
+            type: object
+            properties:
+              eventId:
+                type: string
+                format: uuid
+                nullable: true
+              title:
+                type: string
+              relevanceScore:
+                type: number
+        createdAt:
+          type: string
+          format: date-time
+
+    SessionHistory:
+      type: object
+      required: [sessionId, messages]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Session does not belong to the authenticated user.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    UnprocessableEntity:
+      description: Message content failed validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,487 @@
+# File: search.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/search.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Search Service API
+  version: 1.0.0
+  description: |
+    Full-text and faceted search over events, venues, and organisers backed by
+    Elasticsearch. Indexes are populated from Kafka `event.published` events
+    (within 30s of publishing — NFR-PERF-010) and `venue.updated` events.
+
+    Also exposes semantic search (vector similarity via Qdrant) and image-based
+    search endpoints. Performance targets:
+    - Keyword search: p99 < 500ms at sustained 100 RPS (NFR-PERF-006)
+    - Semantic search: p99 < 800ms (NFR-PERF-007)
+    - Image search: p99 < 3000ms (NFR-PERF-008)
+
+    Degradation: keyword search degrades gracefully if Elasticsearch is slow;
+    semantic search is best-effort (T2 service, not T1).
+  x-service-tier: T2
+  x-repo: stagepass-search-service
+  x-traces-to:
+    - PRD §8.1 FR-C-001 (Customer event discovery)
+    - PRD §8.5 (AI features — semantic search, image search)
+    - NFR-PERF-006, NFR-PERF-007, NFR-PERF-008, NFR-PERF-010
+
+servers:
+  - url: http://localhost:8090
+    description: Local development
+  - url: https://api.stagepass.dev/search
+    description: Staging
+
+tags:
+  - name: Search
+    description: Keyword and faceted search
+  - name: SemanticSearch
+    description: Vector similarity and image-based search
+  - name: Health
+
+paths:
+
+  /search/events:
+    get:
+      operationId: searchEvents
+      tags: [Search]
+      summary: Search published events (keyword + faceted)
+      description: |
+        Full-text search over event title, description, and category. Supports
+        faceted filtering by city, date range, category, price range, and venue.
+        Results are sorted by relevance score (default) or event date.
+
+        Only PUBLISHED events are returned for all callers.
+        Response time target: p99 < 500ms. (NFR-PERF-006)
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Free-text search query.
+          schema:
+            type: string
+            maxLength: 200
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: categoryId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: fromDate
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: toDate
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: minPrice
+          in: query
+          schema:
+            type: string
+            pattern: '^\d+\.\d{4}$'
+          description: Minimum ticket price (decimal string, 4dp). (ADR-004 §3.3)
+        - name: maxPrice
+          in: query
+          schema:
+            type: string
+            pattern: '^\d+\.\d{4}$'
+        - name: venueId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [RELEVANCE, DATE_ASC, DATE_DESC, PRICE_ASC, PRICE_DESC]
+            default: RELEVANCE
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Search results with facet aggregations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /search/venues:
+    get:
+      operationId: searchVenues
+      tags: [Search]
+      summary: Search venues
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 200
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: minCapacity
+          in: query
+          schema:
+            type: integer
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Venue search results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenueSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /search/semantic/events:
+    get:
+      operationId: semanticSearchEvents
+      tags: [SemanticSearch]
+      summary: Semantic (vector) search over events
+      description: |
+        Uses a natural-language query to find semantically similar events via
+        vector embeddings stored in Qdrant. Useful for intent-based queries
+        like "upbeat live music in Mumbai next weekend".
+
+        Response time target: p99 < 800ms. (NFR-PERF-007)
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Natural language query string.
+          schema:
+            type: string
+            maxLength: 500
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+        - name: city
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Semantically similar events ranked by vector similarity score.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SemanticSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /search/image:
+    post:
+      operationId: imageSearch
+      tags: [SemanticSearch]
+      summary: Find events similar to an uploaded image
+      description: |
+        Accepts a JPEG/PNG image and returns events whose poster embeddings are
+        most similar to the query image (Qdrant CLIP embeddings).
+
+        Response time target: p99 < 3000ms. (NFR-PERF-008)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: JPEG or PNG image. Max 5MB.
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+                  default: 10
+      responses:
+        '200':
+          description: Events ranked by visual similarity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SemanticSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Image format not supported or too large.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks Elasticsearch and Qdrant connectivity.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    EventSearchHit:
+      type: object
+      required: [eventId, title, status, eventDate, venueCity, minPrice, score]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+        eventDate:
+          type: string
+          format: date-time
+        venueId:
+          type: string
+          format: uuid
+        venueName:
+          type: string
+        venueCity:
+          type: string
+        posterUrl:
+          type: string
+          format: uri
+        categoryIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        minPrice:
+          type: object
+          properties:
+            amount:
+              type: string
+              pattern: '^\d+\.\d{4}$'
+            currency:
+              type: string
+        score:
+          type: number
+          format: double
+          description: Elasticsearch relevance score.
+
+    FacetBucket:
+      type: object
+      required: [key, count]
+      properties:
+        key:
+          type: string
+        count:
+          type: integer
+
+    EventSearchResponse:
+      type: object
+      required: [items, nextCursor, totalHits, facets]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventSearchHit'
+        nextCursor:
+          type: string
+          nullable: true
+        totalHits:
+          type: integer
+          description: Total matching documents (for display only — do not use for offset pagination).
+        facets:
+          type: object
+          properties:
+            cities:
+              type: array
+              items:
+                $ref: '#/components/schemas/FacetBucket'
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/FacetBucket'
+
+    VenueSearchHit:
+      type: object
+      required: [venueId, name, city, totalCapacity]
+      properties:
+        venueId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        city:
+          type: string
+        totalCapacity:
+          type: integer
+        photoUrl:
+          type: string
+          format: uri
+          nullable: true
+        score:
+          type: number
+          format: double
+
+    VenueSearchResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VenueSearchHit'
+        nextCursor:
+          type: string
+          nullable: true
+
+    SemanticSearchHit:
+      type: object
+      required: [eventId, title, similarityScore]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        posterUrl:
+          type: string
+          format: uri
+          nullable: true
+        eventDate:
+          type: string
+          format: date-time
+        venueCity:
+          type: string
+        similarityScore:
+          type: number
+          format: double
+          description: Cosine similarity score (0.0–1.0). Higher is more similar.
+
+    SemanticSearchResponse:
+      type: object
+      required: [items, query]
+      properties:
+        query:
+          type: string
+          description: The original query string (echoed for UI display).
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SemanticSearchHit'
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []

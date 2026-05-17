@@ -1,0 +1,390 @@
+# File: waitlist.yaml
+# Repo: stagepass-docs
+# Path: /docs/api/waitlist.yaml
+openapi: 3.1.0
+
+info:
+  title: StagePass — Waitlist Service API
+  version: 1.0.0
+  description: |
+    Manages per-event waitlists for sold-out events. The waitlist is stored as a
+    Redis sorted set (score = join timestamp for FIFO ordering). When a seat is
+    released, the top waitlist member receives a time-limited offer via the
+    Notification Service. If the offer expires, the next member is promoted.
+    (PRD §7.6 — Waitlist management)
+
+    Degradation: if this service is down, waitlist join requests are queued.
+    No immediate offer is sent. The service processes the backlog on recovery.
+    (NFR-AVAIL — T3 fail-open)
+
+    This service does not hold or book seats — it only manages the queue.
+    Accepting a waitlist offer redirects the Customer to the standard booking flow.
+  x-service-tier: T3
+  x-repo: stagepass-waitlist-service
+  x-traces-to:
+    - PRD §7.6 (Waitlist management)
+    - PRD §8.1 FR-C-007 (Customer waitlist feature)
+    - ADR-003 §3.4 (Kafka events — seat.released, waitlist.offer.expired)
+
+servers:
+  - url: http://localhost:8089
+    description: Local development
+  - url: https://api.stagepass.dev/waitlist
+    description: Staging
+
+tags:
+  - name: Waitlist
+    description: Joining and leaving event waitlists
+  - name: Offers
+    description: Time-limited seat offers generated from waitlist
+  - name: Health
+
+paths:
+
+  /waitlist/{eventId}/join:
+    post:
+      operationId: joinWaitlist
+      tags: [Waitlist]
+      summary: Join the waitlist for a sold-out event (Customer only)
+      description: |
+        Adds the authenticated Customer to the waitlist for the specified event.
+        Position is based on join timestamp (FIFO). The Customer receives a
+        WebSocket push with their queue position when they join.
+
+        Idempotent: joining a waitlist the Customer is already on returns their
+        current position without adding a duplicate entry. (NFR-REL-001)
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seatPreference:
+                  type: string
+                  enum: [STANDARD, PREMIUM, ACCESSIBLE, ANY]
+                  description: Customer's preferred seat type. Used for offer matching.
+      responses:
+        '201':
+          description: Customer added to waitlist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitlistEntry'
+        '400':
+          description: Event is not sold-out; direct booking available.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Customer already on waitlist for this event. Returns current entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitlistEntry'
+
+  /waitlist/{eventId}/position:
+    get:
+      operationId: getWaitlistPosition
+      tags: [Waitlist]
+      summary: Get the authenticated Customer's position in the waitlist
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Current waitlist position.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WaitlistEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Customer is not on the waitlist for this event.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /waitlist/{eventId}/leave:
+    delete:
+      operationId: leaveWaitlist
+      tags: [Waitlist]
+      summary: Remove the authenticated Customer from the waitlist
+      description: |
+        Idempotent: calling this when not on the waitlist returns 204. No error.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '204':
+          description: Removed from waitlist (or was not on it).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /waitlist/{eventId}/depth:
+    get:
+      operationId: getWaitlistDepth
+      tags: [Waitlist]
+      summary: Get total waitlist depth for an event (Organiser / Admin)
+      description: Returns the number of Customers waiting. Used for event planning and analytics.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Waitlist depth.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [eventId, depth]
+                properties:
+                  eventId:
+                    type: string
+                    format: uuid
+                  depth:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /waitlist/offers/{offerId}/accept:
+    post:
+      operationId: acceptOffer
+      tags: [Offers]
+      summary: Accept a waitlist seat offer (Customer only)
+      description: |
+        When a seat is released, the top waitlist member receives a time-limited
+        offer. Accepting the offer transitions the Customer to the standard booking
+        flow with the offered seat pre-selected.
+
+        The offer has a configurable TTL (default: 15 minutes). Accepting after
+        TTL expiry returns 410 Gone and the next member is promoted.
+      parameters:
+        - $ref: '#/components/parameters/OfferId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Offer accepted. Returns a pre-populated booking redirect.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferAcceptedResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: Offer has expired. Next waitlist member has been promoted.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+
+  /waitlist/offers/{offerId}/decline:
+    post:
+      operationId: declineOffer
+      tags: [Offers]
+      summary: Decline a waitlist seat offer (Customer only)
+      description: |
+        Explicitly declining removes the Customer from the waitlist and promotes
+        the next member. This is preferred over letting the offer expire, as it
+        frees the seat for the next Customer sooner.
+      parameters:
+        - $ref: '#/components/parameters/OfferId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Offer declined. Customer removed from waitlist.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      description: Checks Redis sorted set connectivity and Kafka producer.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OfferId:
+      name: offerId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail, instance, traceId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+
+    WaitlistEntry:
+      type: object
+      required: [entryId, eventId, customerId, position, joinedAt]
+      properties:
+        entryId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        position:
+          type: integer
+          description: 1-based position in queue. May change as members ahead leave.
+        seatPreference:
+          type: string
+          enum: [STANDARD, PREMIUM, ACCESSIBLE, ANY]
+          nullable: true
+        joinedAt:
+          type: string
+          format: date-time
+
+    OfferAcceptedResponse:
+      type: object
+      required: [offerId, eventId, seatId, bookingRedirectToken]
+      properties:
+        offerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          description: The offered seat identifier. Pre-selected in the booking flow.
+        bookingRedirectToken:
+          type: string
+          description: |
+            Short-lived token the storefront uses to initiate a booking with the
+            offered seat pre-selected. Expires when the seat hold window expires.
+        offerExpiresAt:
+          type: string
+          format: date-time
+
+    HealthStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    Forbidden:
+      description: Insufficient role.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+
+security:
+  - bearerAuth: []
