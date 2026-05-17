@@ -1,0 +1,686 @@
+# ============================================================
+# payment.yaml
+#
+# AsyncAPI 2.6 contract — Payment Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/payment.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (payment.events)
+#   ADR-004 §3.3    — Money wire format
+#   ADR-005 §3.4    — Saga steps 2–3 (payment initiation + capture)
+#   ADR-005 §3.5    — Outbox pattern (Payment Service uses Outbox)
+#   NFR-REL-009     — HMAC webhook signature verification
+#   NFR-REL-002     — Consumer idempotency
+#   NFR-REL-007     — DLQ per topic
+#
+# Topics covered:
+#   payment.events      (6 partitions, key=paymentOrderId, 7-day retention)
+#   payment.events.dlq  (6 partitions, 14-day retention)
+#
+# Payment flow summary:
+#   Booking Service calls POST /payment-orders (REST, ADR-005 Step 2).
+#   Payment Service creates a Razorpay order, then receives the payment
+#   result via Razorpay webhook (verified with HMAC-SHA256, NFR-REL-009).
+#   Payment Service publishes to payment.events via Outbox (ADR-005 §3.5.1).
+#   Booking Service (booking-service-consumer) consumes payment.events to
+#   drive the saga forward (captured → CommitSeats) or execute compensation
+#   (failed → ReleaseSeats).
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:payment'
+
+info:
+  title: StagePass — Payment Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Payment domain** Kafka topics.
+
+    **Publisher:** Payment Service (Quarkus / Java 21).
+    Events are published via the **Outbox pattern** (ADR-005 §3.5.1) to
+    guarantee no dual-write loss between PostgreSQL and Kafka.
+
+    **Webhook source:** Payment events are ultimately triggered by
+    Razorpay webhooks. The Payment Service verifies every inbound webhook
+    with HMAC-SHA256 before processing (NFR-REL-009). Unverified webhooks
+    return HTTP 401 and are logged as security events — they never produce
+    a Kafka message.
+
+    **Partition key: paymentOrderId** (not bookingId). A payment order
+    maps 1:1 to a booking at checkout, but refunds may be partial and
+    multiple refund events may exist per order. Keying by paymentOrderId
+    ensures payment.initiated → payment.authorised → payment.captured
+    arrive in order at the Booking Service consumer (ADR-003 §3.4.2
+    partition key rationale).
+  contact:
+    name: StagePass Platform Team
+    url: https://github.com/stagepass-aiman/stagepass-docs
+    email: platform@stagepass.internal
+  license:
+    name: Proprietary — StagePass internal
+
+tags:
+  - name: payment
+    description: Payment lifecycle events — Razorpay integration
+
+defaultContentType: application/json
+
+servers:
+  kafka-local:
+    url: 'kafka:9092'
+    protocol: kafka
+    description: Apache Kafka (Strimzi) — local Docker Compose stack.
+  kafka-staging:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: Amazon MSK — staging / production
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap endpoint
+
+channels:
+
+  # ----------------------------------------------------------
+  # payment.events
+  # ADR-003 §3.4.2 — 6 partitions, key=paymentOrderId, 7-day retention
+  # ----------------------------------------------------------
+  payment.events:
+    description: |
+      Payment lifecycle events published by the Payment Service.
+      Covers the payment order lifecycle: INITIATED → AUTHORISED → CAPTURED
+      (success path) or FAILED (failure path), plus REFUND_INITIATED →
+      REFUND_COMPLETED for the cancellation compensation saga.
+
+      **Partition key: paymentOrderId.**
+      Ordered delivery of payment state transitions to the Booking Service
+      consumer: INITIATED before AUTHORISED before CAPTURED. Out-of-order
+      processing would corrupt the booking saga state machine.
+
+      **Consumers:**
+        - booking-service-consumer: drives the saga forward (on CAPTURED)
+          or initiates compensation (on FAILED). This is the primary consumer.
+        - disbursement-service-consumer: records payment captured event for
+          the immutable disbursement ledger (ADR-008).
+
+      **HMAC verification note:** Every message in this topic was produced
+      only after the Payment Service verified the Razorpay webhook HMAC
+      signature (NFR-REL-009). Consumers can trust that these events
+      correspond to genuine payment provider state transitions.
+    x-producer: payment-service
+    x-kafka-partition-key: paymentOrderId
+    x-consumer-groups:
+      - booking-service-consumer
+      - disbursement-service-consumer
+    bindings:
+      kafka:
+        topic: payment.events
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receivePaymentEvent
+      summary: Receive a payment lifecycle event
+      message:
+        oneOf:
+          - $ref: '#/components/messages/PaymentInitiated'
+          - $ref: '#/components/messages/PaymentAuthorised'
+          - $ref: '#/components/messages/PaymentCaptured'
+          - $ref: '#/components/messages/PaymentFailed'
+          - $ref: '#/components/messages/PaymentRefundInitiated'
+          - $ref: '#/components/messages/PaymentRefundCompleted'
+
+  # ----------------------------------------------------------
+  # payment.events.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  payment.events.dlq:
+    description: |
+      Dead-letter queue for payment.events (NFR-REL-007, ADR-003 §3.4.1).
+
+      A dead-lettered payment event is operationally severe — the Booking
+      Service may not have received a payment.captured event, leaving a
+      booking in PAYMENT_INITIATED state with real money captured.
+
+      **Immediate action required** when KafkaDLQDepthNonZero fires on
+      this topic. Runbook: /docs/runbooks/kafka-dlq-depth.md.
+
+      The idempotency key in the original payment event payload allows
+      safe replay: replaying a payment.captured event that was already
+      processed must not trigger a duplicate CommitSeats gRPC call.
+    x-original-topic: payment.events
+    x-kafka-partition-key: paymentOrderId
+    x-consumer-groups:
+      - payment-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: payment.events.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receivePaymentEventDLQ
+      summary: Receive a dead-lettered payment event for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredPaymentMessage'
+
+components:
+
+  messages:
+
+    PaymentInitiated:
+      messageId: PaymentInitiated
+      name: PaymentInitiated
+      title: Payment Initiated
+      summary: A Razorpay payment order has been created for this booking.
+      description: |
+        Published when the Payment Service creates a Razorpay payment order
+        in response to the Booking Service's REST call (ADR-005 Step 2).
+        The booking is now in PAYMENT_INITIATED state. The `razorpayOrderId`
+        is used by the browser SDK to open the Razorpay payment modal.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentInitiatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: paymentOrderId
+
+    PaymentAuthorised:
+      messageId: PaymentAuthorised
+      name: PaymentAuthorised
+      title: Payment Authorised
+      summary: Razorpay has authorised the payment. Awaiting capture.
+      description: |
+        Razorpay's two-step capture flow: authorisation first (bank approves),
+        then capture (funds move). The Booking Service does not advance the
+        saga on AUTHORISED alone — it waits for CAPTURED (NFR-REL-008:
+        money-touching operations are transactional; funds must be captured
+        before seats are committed to BOOKED).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentAuthorisedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PaymentCaptured:
+      messageId: PaymentCaptured
+      name: PaymentCaptured
+      title: Payment Captured
+      summary: Funds captured. Booking saga proceeds to CommitSeats.
+      description: |
+        The saga-advancing event. On receiving this, the Booking Service
+        (booking-service-consumer) calls gRPC CommitSeats to transition
+        seats HELD → BOOKED under SERIALIZABLE isolation (ADR-006 §3.7).
+
+        **Idempotency:** If CommitSeats gRPC was already called for this
+        paymentOrderId (message replayed from DLQ), CommitSeats is
+        idempotent — it returns success without corrupting seat state.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentCapturedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PaymentFailed:
+      messageId: PaymentFailed
+      name: PaymentFailed
+      title: Payment Failed
+      summary: Payment could not be captured. Booking saga compensates.
+      description: |
+        On receiving this, the Booking Service initiates compensation:
+        ReleaseSeats gRPC (HELD → AVAILABLE) and optionally a refund if
+        partial authorisation occurred.
+
+        If Payment Service was DOWN during the gRPC HoldSeats → payment REST
+        call window, the Booking Service automatically extends the seat hold
+        by 5 minutes (NFR-AVAIL-003, ADR-005 §3.7) and returns 503 to the
+        customer with Retry-After. Payment failure via webhook produces this
+        event; the Booking Service does not extend hold on payment failure —
+        it releases seats.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentFailedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PaymentRefundInitiated:
+      messageId: PaymentRefundInitiated
+      name: PaymentRefundInitiated
+      title: Refund Initiated
+      summary: A refund request has been submitted to Razorpay.
+      description: |
+        Published when the Payment Service submits a refund request to
+        Razorpay in response to the booking cancellation compensation saga.
+        Razorpay refunds are asynchronous — this event does not mean the
+        customer has received funds. PaymentRefundCompleted confirms that.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentRefundInitiatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PaymentRefundCompleted:
+      messageId: PaymentRefundCompleted
+      name: PaymentRefundCompleted
+      title: Refund Completed
+      summary: Razorpay has confirmed the refund is processed.
+      description: |
+        Consumed by the Booking Service to advance the booking to
+        REFUND_CONFIRMED → CANCELLED states. Consumed by the
+        Disbursement Service to reduce the disbursable amount by the
+        refunded split amounts (ADR-008).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PaymentRefundCompletedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredPaymentMessage:
+      messageId: DeadLetteredPaymentMessage
+      name: DeadLetteredPaymentMessage
+      title: Dead-Lettered Payment Message
+      summary: A payment.events message that failed delivery after 3 attempts.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassDLQHeaders'
+      payload:
+        type: object
+        additionalProperties: true
+        description: Original payload verbatim. Use x-event-type header for schema selection.
+
+  schemas:
+
+    MoneyAmount:
+      type: object
+      description: |
+        ADR-004 §3.3 — amount as string, exactly 4dp, ISO-4217 currency.
+        NEVER a JSON number.
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: 'INR'
+
+    StagePassMessageHeaders:
+      type: object
+      description: Standard Kafka headers per ADR-003 §3.4.1 and §3.6.3.
+      required:
+        - x-event-type
+        - x-correlation-id
+        - x-traceparent
+        - x-produced-at
+        - x-schema-version
+      properties:
+        x-event-type:
+          type: string
+          example: 'payment.captured'
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          example: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          example: '1.0.0'
+
+    StagePassDLQHeaders:
+      allOf:
+        - $ref: '#/components/schemas/StagePassMessageHeaders'
+        - type: object
+          required: [x-failure-reason, x-original-topic, x-delivery-attempt]
+          properties:
+            x-failure-reason:
+              type: string
+              example: 'java.lang.RuntimeException: Booking saga in invalid state'
+            x-original-topic:
+              type: string
+              const: 'payment.events'
+            x-original-partition:
+              type: integer
+              minimum: 0
+            x-original-offset:
+              type: integer
+              format: int64
+            x-failure-timestamp:
+              type: string
+              format: date-time
+            x-delivery-attempt:
+              type: integer
+              const: 3
+
+    # ---- Payload schemas ---
+
+    PaymentInitiatedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - customerId
+        - amount
+        - razorpayOrderId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.initiated'
+        paymentOrderId:
+          type: string
+          format: uuid
+          description: Platform-internal payment order ID
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/MoneyAmount'
+        razorpayOrderId:
+          type: string
+          description: |
+            Razorpay order ID (e.g. "order_IluGWX1BXcIPkr"). Passed to the
+            browser SDK to open the payment modal. Not a UUID — Razorpay-format.
+          example: 'order_IluGWX1BXcIPkr'
+        status:
+          type: string
+          const: 'INITIATED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentAuthorisedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - amount
+        - razorpayPaymentId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.authorised'
+        paymentOrderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/MoneyAmount'
+        razorpayPaymentId:
+          type: string
+          description: Razorpay payment ID returned after authorisation.
+          example: 'pay_IluGWX1BXcIPkr'
+        status:
+          type: string
+          const: 'AUTHORISED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentCapturedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - customerId
+        - amountCaptured
+        - razorpayPaymentId
+        - razorpayOrderId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.captured'
+        paymentOrderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        amountCaptured:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: |
+            Must equal the booking totalAmount. Any mismatch is flagged as a
+            fraud signal and published to fraud.score-requests.
+        razorpayPaymentId:
+          type: string
+          example: 'pay_IluGWX1BXcIPkr'
+        razorpayOrderId:
+          type: string
+          example: 'order_IluGWX1BXcIPkr'
+        status:
+          type: string
+          const: 'CAPTURED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentFailedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - customerId
+        - amount
+        - failureReason
+        - failureCode
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.failed'
+        paymentOrderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        amount:
+          $ref: '#/components/schemas/MoneyAmount'
+        failureReason:
+          type: string
+          description: Human-readable failure reason from Razorpay.
+          example: 'Insufficient funds'
+        failureCode:
+          type: string
+          description: Razorpay error code for programmatic handling.
+          example: 'INSUFFICIENT_FUNDS'
+        razorpayErrorCode:
+          type: string
+          description: Raw Razorpay error code for debugging.
+        status:
+          type: string
+          const: 'FAILED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentRefundInitiatedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - refundId
+        - refundAmount
+        - razorpayRefundId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.refund-initiated'
+        paymentOrderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        refundId:
+          type: string
+          format: uuid
+        refundAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        razorpayRefundId:
+          type: string
+          description: Razorpay refund ID for tracking.
+          example: 'rfnd_FP8QHiV938haTz'
+        status:
+          type: string
+          const: 'REFUND_INITIATED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    PaymentRefundCompletedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - paymentOrderId
+        - bookingId
+        - refundId
+        - refundAmount
+        - razorpayRefundId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'payment.refund-completed'
+        paymentOrderId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        refundId:
+          type: string
+          format: uuid
+        refundAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        razorpayRefundId:
+          type: string
+        status:
+          type: string
+          const: 'REFUND_COMPLETED'
+        occurredAt:
+          type: string
+          format: date-time

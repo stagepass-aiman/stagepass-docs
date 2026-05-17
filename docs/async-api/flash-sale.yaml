@@ -1,0 +1,622 @@
+# ============================================================
+# flash-sale.yaml
+#
+# AsyncAPI 2.6 contract — Flash Sale Queue Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/flash-sale.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-007         — Flash sale queue pattern (authoritative)
+#   ADR-003 §3.4.2  — Topic catalogue (partition keys, partition counts)
+#   ADR-004 §3.3    — Money wire format (not directly in these payloads,
+#                     but prices are in flash-sale context via booking)
+#   NFR-PERF-013    — Flash sale: 10x RPS, 0 oversells, <0.5% error rate
+#   NFR-REL-002     — Consumer idempotency
+#   NFR-REL-004     — Hold TTL = 600s via Redis
+#   NFR-REL-007     — DLQ per topic
+#   NFR-OBS-005     — Flash sale queue depth in Grafana
+#
+# Topics covered:
+#   flash-sale.hold-requests      (24 partitions, key=eventId, 1-day retention)
+#   flash-sale.hold-results       (12 partitions, key=customerId, 1-day retention)
+#   flash-sale.hold-requests.dlq  (24 partitions, 14-day retention)
+#   flash-sale.hold-results.dlq   (12 partitions, 14-day retention)
+#
+# Flash sale architectural summary (ADR-007):
+#   1. Booking Service detects flash sale mode via Redis flag:
+#      GET flash-sale:mode:{eventId} → "active"
+#   2. Instead of gRPC HoldSeats, publishes to flash-sale.hold-requests.
+#   3. Seat Inventory Service consumer (seat-inventory-service-consumer)
+#      processes requests FIFO per event partition (fairness guarantee).
+#   4. Atomically executes the Redis Lua hold script (ADR-006 §3.2).
+#   5. Publishes result to flash-sale.hold-results.
+#   6. Booking Service and Notification Service consume the result and
+#      advance the saga or notify the customer respectively.
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: urn:stagepass:asyncapi:flash-sale
+
+info:
+  title: StagePass — Flash Sale Queue Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Flash Sale queue** Kafka topics.
+
+    The flash sale queue pattern (ADR-007) is activated when inbound RPS
+    for an event exceeds the gRPC direct path capacity (> 100 concurrent
+    hold attempts). It converts thousands of simultaneous booking requests
+    into a serialised, fair queue without overselling and without collapsing
+    the Seat Inventory Service (NFR-PERF-013: 10× RPS, 0 oversells, <0.5%
+    error rate for 60s sustained).
+
+    **Key design invariant:** The atomicity guarantee is provided by the
+    Redis Lua script (ADR-006 §3.2/3.8) — not by the queue. The queue
+    adds *fairness and load levelling*; the Lua script remains the mutual
+    exclusion mechanism. Queue serialisation does not weaken atomicity.
+
+    **FIFO fairness:** All HoldRequest messages for a given event land on
+    the same Kafka partition (partition key=eventId). Kafka partition ordering
+    guarantees first-come, first-served within an event (PRD FR-P-003 AC5).
+
+    **Observable:** Flash sale queue depth = Kafka consumer group lag for
+    seat-inventory-service-consumer on flash-sale.hold-requests.
+    Grafana business metric (NFR-OBS-005): refreshed every 60s.
+  contact:
+    name: StagePass Platform Team
+    url: https://github.com/stagepass-aiman/stagepass-docs
+    email: platform@stagepass.internal
+  license:
+    name: Proprietary — StagePass internal
+
+tags:
+  - name: flash-sale
+    description: Flash sale queue pattern — ADR-007
+  - name: concurrency
+    description: High-concurrency seat hold mechanism
+
+defaultContentType: application/json
+
+servers:
+  kafka-local:
+    url: 'kafka:9092'
+    protocol: kafka
+    description: Apache Kafka (Strimzi) — local Docker Compose stack.
+  kafka-staging:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: Amazon MSK — staging / production
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap endpoint
+
+channels:
+
+  # ----------------------------------------------------------
+  # flash-sale.hold-requests
+  # ADR-007 §3.5, ADR-003 §3.4.2
+  # 24 partitions, key=eventId, 1-day retention
+  # ----------------------------------------------------------
+  flash-sale.hold-requests:
+    description: |
+      Flash sale seat hold requests published by the Booking Service when
+      an event is in flash sale mode.
+
+      **Why 24 partitions?**
+      Matches seat.state-changes (ADR-003 §3.4.2) so that each event
+      occupies its own partition, preventing a popular event's load from
+      starving another event's queue. Multiple events can be in flash sale
+      mode simultaneously without interference.
+
+      **Partition key: eventId.**
+      Total ordering per event. The Kafka partition ordering guarantee
+      provides first-come, first-served fairness within an event.
+      The first HoldRequest committed to the partition is the first served.
+      This is a hard requirement (PRD FR-P-003 AC5: no priority lane,
+      no random shuffle).
+
+      **Consumer: seat-inventory-service-consumer only.**
+      One consumer thread per partition (ADR-007 §3.7). The consumer
+      calls the Redis Lua script for each request in partition order.
+      At 24 msg/s per partition × 24 partitions = 576 requests/s sustained
+      throughput. For flash sale at 1,000 RPS: ~42 msg/s per event partition
+      for a single-event flash sale, which is within the consumer throughput
+      model (ADR-007 §3.7).
+
+      **expiresAt field:** The Booking Service sets expiresAt = now + 600s.
+      The Seat Inventory consumer checks this before executing the Lua script.
+      If the message has been sitting in the queue longer than 600s (network
+      delay, consumer lag), the consumer publishes HOLD_EXPIRED to
+      flash-sale.hold-results without executing the Lua script.
+
+      **Idempotent producer (ADR-007 §3.5):**
+      acks=all, enable.idempotence=true. A successfully returned
+      RecordMetadata guarantees durable Kafka write. The Booking Service
+      records the partition:offset in Redis for queue position display.
+    x-producer: booking-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - seat-inventory-service-consumer
+    bindings:
+      kafka:
+        topic: flash-sale.hold-requests
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 86400000      # 1 day — ADR-003 §3.4.2, ADR-007 §3.5
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFlashSaleHoldRequest
+      summary: Receive a flash sale seat hold request (Seat Inventory Service only)
+      description: |
+        The Seat Inventory Service consumer processes exactly one HoldRequest
+        at a time per partition (no parallel processing within a partition —
+        ordering is the fairness mechanism). After processing, it commits
+        the offset and publishes the result to flash-sale.hold-results before
+        processing the next message.
+      message:
+        $ref: '#/components/messages/FlashSaleHoldRequest'
+
+  # ----------------------------------------------------------
+  # flash-sale.hold-results
+  # ADR-007 §3.6, ADR-003 §3.4.2
+  # 12 partitions, key=customerId, 1-day retention
+  # ----------------------------------------------------------
+  flash-sale.hold-results:
+    description: |
+      Flash sale hold results published by the Seat Inventory Service after
+      processing each HoldRequest. Two consumer groups each receive every
+      message independently (Kafka fan-out):
+
+      **notification-service-consumer:**
+      Pushes personalised result to `user:{customerId}` room:
+        HOLD_SUCCEEDED → "queue.hold-granted" WebSocket event (customer
+          proceeds to checkout immediately)
+        HOLD_FAILED    → "queue.hold-denied" with unavailableSeats[]
+        HOLD_EXPIRED   → "queue.hold-denied" (timeout variant)
+      Also pushes aggregate seat state update to `event:{eventId}` room
+      for seat map refresh (affects all browsers viewing this event's map).
+
+      **booking-service-consumer:**
+      On HOLD_SUCCEEDED: transitions booking PENDING → SEATS_HELD and
+      immediately initiates the payment step (ADR-005 §3.4 Step 2: REST
+      POST to Payment Service). The saga continues identically to the
+      normal (non-flash-sale) path from this point.
+      On HOLD_FAILED or HOLD_EXPIRED: transitions booking PENDING → CANCELLED.
+
+      **Partition key: customerId** (not bookingId or eventId).
+      Reasoning (ADR-007 §3.6): The Notification Service pushes results to
+      the customer's WebSocket room. Keying by customerId collocates all
+      notifications for one customer on one partition, ensuring ordering of
+      messages to a given user. Keying by eventId would create a hotspot
+      for popular events (all results for 1,000 concurrent customers on
+      one partition = one consumer thread processing 1,000 results in
+      series — throughput bottleneck).
+
+      **Queue position display:**
+      Before receiving HOLD_SUCCEEDED or HOLD_FAILED, the Booking Service
+      can derive the customer's queue position from the
+      `flash-sale:position:{bookingId}` Redis key (partition:offset) vs.
+      the current consumer lag reported by Kafka (ADR-007 §3.8).
+    x-producer: seat-inventory-service
+    x-kafka-partition-key: customerId
+    x-consumer-groups:
+      - notification-service-consumer
+      - booking-service-consumer
+    bindings:
+      kafka:
+        topic: flash-sale.hold-results
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 86400000      # 1 day — ADR-003 §3.4.2, ADR-007 §3.6
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFlashSaleHoldResult
+      summary: Receive a flash sale hold result
+      description: |
+        Both consumer groups process every message independently. Consumers
+        MUST deduplicate on messageId (NFR-REL-002) because at-least-once
+        delivery may replay results (e.g. on consumer rebalance). A replayed
+        HOLD_SUCCEEDED must not trigger a duplicate payment initiation.
+        Use Redis SET NX messageId "processed" EX 3600.
+      message:
+        $ref: '#/components/messages/FlashSaleHoldResult'
+
+  # ----------------------------------------------------------
+  # flash-sale.hold-requests.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  flash-sale.hold-requests.dlq:
+    description: |
+      Dead-letter queue for flash-sale.hold-requests (NFR-REL-007).
+      A dead-lettered HoldRequest means the Seat Inventory consumer
+      failed to process it after 3 attempts. The customer's booking is
+      stuck in PENDING state. The Booking Service saga timeout
+      (watchdog job) will eventually cancel the booking and release
+      the hold context, but the customer will not receive a timely result.
+
+      **During an active flash sale this is a P0 alert.** The
+      KafkaDLQDepthNonZero alert fires within 6 minutes. Immediate
+      investigation and replay required.
+    x-original-topic: flash-sale.hold-requests
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - flash-sale-hold-requests-dlq-consumer
+    bindings:
+      kafka:
+        topic: flash-sale.hold-requests.dlq
+        partitions: 24
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFlashSaleHoldRequestDLQ
+      summary: Receive a dead-lettered flash sale hold request
+      message:
+        $ref: '#/components/messages/DeadLetteredFlashSaleMessage'
+
+  # ----------------------------------------------------------
+  # flash-sale.hold-results.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  flash-sale.hold-results.dlq:
+    description: |
+      Dead-letter queue for flash-sale.hold-results (NFR-REL-007).
+      A dead-lettered HoldResult means the Booking Service or Notification
+      Service failed to process the seat hold outcome. The customer may be
+      left in a HOLD_SUCCEEDED state with no WebSocket confirmation and no
+      saga advancement. Also a P0 alert during an active flash sale.
+    x-original-topic: flash-sale.hold-results
+    x-kafka-partition-key: customerId
+    x-consumer-groups:
+      - flash-sale-hold-results-dlq-consumer
+    bindings:
+      kafka:
+        topic: flash-sale.hold-results.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFlashSaleHoldResultDLQ
+      summary: Receive a dead-lettered flash sale hold result
+      message:
+        $ref: '#/components/messages/DeadLetteredFlashSaleMessage'
+
+components:
+
+  messages:
+
+    FlashSaleHoldRequest:
+      messageId: FlashSaleHoldRequest 
+      name: FlashSaleHoldRequest
+      title: Flash Sale Hold Request
+      summary: Request to hold seats for a booking in flash sale mode.
+      description: |
+        Published by the Booking Service instead of calling gRPC HoldSeats
+        when flash sale mode is active for the event (GET flash-sale:mode:{eventId}
+        returns "active" from Redis, ADR-007 §3.3).
+
+        **All-or-nothing semantics:** The Seat Inventory consumer holds ALL
+        requested seatIds or NONE. Partial holds are not published — the Lua
+        script is atomic (ADR-006 §3.2, ADR-007 §3.5 consumer note).
+
+        **expiresAt:** The Booking Service sets this to now + 600s (matching
+        the Redis hold TTL, NFR-REL-004). The consumer checks this BEFORE
+        executing the Lua script. If now > expiresAt, publish HOLD_EXPIRED
+        without executing the Lua script — the customer has been waiting too
+        long; the seat selection UI has already timed them out.
+
+        **Seat count validation (ADR-005 §3.4 Step 1):**
+        The Booking Service validates 1–8 seats before publishing. The
+        Seat Inventory consumer does NOT re-validate the count.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/FlashSaleHoldRequestPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — FIFO ordering and fairness per event
+
+    FlashSaleHoldResult:
+      messageId: FlashSaleHoldResult
+      name: FlashSaleHoldResult
+      title: Flash Sale Hold Result
+      summary: Result of a flash sale hold request from the Seat Inventory Service.
+      description: |
+        Published by the Seat Inventory Service consumer after executing (or
+        choosing not to execute, in the HOLD_EXPIRED case) the Redis Lua
+        script for a FlashSaleHoldRequest.
+
+        **result enum semantics (ADR-007 §3.6):**
+          HOLD_SUCCEEDED — All requested seats atomically held in Redis with
+            600s TTL. Booking Service must transition PENDING → SEATS_HELD and
+            initiate payment (ADR-005 Step 2). Notification sends "hold granted".
+          HOLD_FAILED    — At least one seat unavailable; NO seats held. Booking
+            Service transitions PENDING → CANCELLED. Notification sends "hold
+            denied" with unavailableSeats[].
+          HOLD_EXPIRED   — Request arrived after expiresAt. Lua script NOT executed.
+            Booking Service transitions PENDING → CANCELLED. Notification sends
+            "hold denied" (timeout variant).
+
+        **Idempotency critical:** A replayed HOLD_SUCCEEDED (from DLQ replay)
+        must not trigger a duplicate payment initiation. The Booking Service
+        consumer must check booking state before acting:
+          if booking.status != PENDING: ack and discard (already processed).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/FlashSaleHoldResultPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: customerId — ordered delivery per customer, prevents hotspot on popular events
+
+    DeadLetteredFlashSaleMessage:
+      name: DeadLetteredFlashSaleMessage
+      title: Dead-Lettered Flash Sale Message
+      summary: A flash sale message that failed delivery after 3 attempts. P0 during active sales.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassDLQHeaders'
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      description: Standard Kafka headers per ADR-003 §3.4.1 and §3.6.3.
+      required:
+        - x-event-type
+        - x-correlation-id
+        - x-traceparent
+        - x-produced-at
+        - x-schema-version
+      properties:
+        x-event-type:
+          type: string
+          example: 'flash-sale.hold-request'
+        x-correlation-id:
+          type: string
+          format: uuid
+          description: Propagated from the original POST /bookings REST request.
+        x-traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          description: |
+            W3C traceparent — enables a single Jaeger trace spanning
+            POST /bookings → flash-sale.hold-requests → flash-sale.hold-results
+            → booking saga continuation (NFR-OBS-003, NFR-OBS-004).
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          example: '1.0.0'
+
+    StagePassDLQHeaders:
+      allOf:
+        - $ref: '#/components/schemas/StagePassMessageHeaders'
+        - type: object
+          required: [x-failure-reason, x-original-topic, x-delivery-attempt]
+          properties:
+            x-failure-reason:
+              type: string
+              description: Exception class and message from the final failed attempt.
+            x-original-topic:
+              type: string
+              enum:
+                - flash-sale.hold-requests
+                - flash-sale.hold-results
+            x-original-partition:
+              type: integer
+              minimum: 0
+            x-original-offset:
+              type: integer
+              format: int64
+            x-failure-timestamp:
+              type: string
+              format: date-time
+            x-delivery-attempt:
+              type: integer
+              const: 3
+
+    FlashSaleHoldRequestPayload:
+      type: object
+      description: |
+        Schema for flash-sale.hold-requests messages (ADR-007 §3.5).
+        All fields are required — the consumer does not apply defaults.
+      required:
+        - messageId
+        - schemaVersion
+        - messageType
+        - bookingId
+        - customerId
+        - eventId
+        - seatIds
+        - idempotencyKey
+        - expiresAt
+        - publishedAt
+        - correlationId
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: |
+            Consumer deduplication key (NFR-REL-002). The Seat Inventory
+            consumer checks Redis for `flash-hold-processed:{bookingId}`
+            before executing the Lua script (ADR-006 §3.10). If the key
+            exists (message replayed), return the cached result without
+            re-executing.
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        messageType:
+          type: string
+          const: 'FlashSaleHoldRequest'
+          description: Matches the ADR-007 §3.5 message schema `messageType` field.
+        bookingId:
+          type: string
+          format: uuid
+          description: |
+            Used as the Redis hold key value: seat:{eventId}:{seatId} = bookingId.
+            All-or-nothing: the Lua script sets this value for ALL seatIds
+            or none (ADR-006 §3.2, §3.8).
+        customerId:
+          type: string
+          format: uuid
+          description: |
+            Used as partition key for flash-sale.hold-results (fan-out to
+            Notification Service routes by customerId to find the WebSocket room).
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            Partition key for this topic. All requests for one event are
+            serialised on one Kafka partition — source of FIFO fairness.
+        seatIds:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: string
+            format: uuid
+          description: |
+            Seats to hold. All-or-nothing: either all are held or none are
+            (ADR-005 §3.4 Step 1, ADR-006 §3.8). The Booking Service validated
+            1–8 count constraint before publishing.
+        idempotencyKey:
+          type: string
+          format: uuid
+          description: |
+            Client idempotency key from POST /bookings (NFR-REL-001).
+            Propagated through the flash sale queue for end-to-end idempotency.
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            UTC expiry time for this hold request = publishedAt + 600s.
+            The consumer MUST check: if now() >= expiresAt, publish HOLD_EXPIRED
+            and discard without executing the Lua script (ADR-007 §3.5).
+            This prevents holding seats for customers whose checkout sessions
+            have already timed out on the client side.
+        publishedAt:
+          type: string
+          format: date-time
+          description: UTC timestamp when the Booking Service published this message.
+        correlationId:
+          type: string
+          format: uuid
+          description: |
+            Same as x-correlation-id header. Present in payload to survive
+            any header-stripping middleware in the Kafka infrastructure.
+
+    FlashSaleHoldResultPayload:
+      type: object
+      description: |
+        Schema for flash-sale.hold-results messages (ADR-007 §3.6).
+        Mirrors the ADR-007 §3.6 JSON schema example exactly.
+      required:
+        - messageId
+        - schemaVersion
+        - messageType
+        - bookingId
+        - customerId
+        - eventId
+        - result
+        - unavailableSeats
+        - processedAt
+        - correlationId
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer deduplication key (NFR-REL-002).
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        messageType:
+          type: string
+          const: 'FlashSaleHoldResult'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+          description: Partition key for this topic (not eventId — avoids hotspot).
+        eventId:
+          type: string
+          format: uuid
+        result:
+          type: string
+          enum:
+            - HOLD_SUCCEEDED
+            - HOLD_FAILED
+            - HOLD_EXPIRED
+          description: |
+            HOLD_SUCCEEDED: All seats atomically held. Booking proceeds to payment.
+            HOLD_FAILED:    At least one seat unavailable. No seats held.
+                            unavailableSeats[] contains the blocking seatIds.
+            HOLD_EXPIRED:   Request arrived after expiresAt. Lua not executed.
+                            Customer timed out in queue.
+        holdId:
+          type: string
+          format: uuid
+          description: |
+            Present only when result=HOLD_SUCCEEDED.
+            Logical hold group ID (same semantics as BookingSeatsHeld.holdId).
+        heldUntil:
+          type: string
+          format: date-time
+          description: |
+            Present only when result=HOLD_SUCCEEDED.
+            Redis TTL expiry timestamp (processedAt + 600s).
+            Notification Service displays this as the checkout countdown timer.
+        unavailableSeats:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Seats that blocked the hold (result=HOLD_FAILED).
+            Empty array when result=HOLD_SUCCEEDED or HOLD_EXPIRED.
+            The Notification Service includes these in the "hold denied"
+            WebSocket event so the UI can highlight unavailable seats.
+        queuePositionAtRequest:
+          type: integer
+          minimum: 0
+          description: |
+            Customer's ordinal queue position when the HoldRequest was
+            published (derived from Kafka partition offset at publish time,
+            ADR-007 §3.8). Informational — used by the UI to display
+            "you were #N in queue" in the HOLD_FAILED notification.
+        processedAt:
+          type: string
+          format: date-time
+          description: UTC timestamp when the Seat Inventory consumer processed this request.
+        correlationId:
+          type: string
+          format: uuid
+          description: Propagated from FlashSaleHoldRequest for end-to-end tracing.

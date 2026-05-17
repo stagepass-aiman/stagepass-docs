@@ -1,0 +1,1479 @@
+# ============================================================
+# booking.yaml
+#
+# AsyncAPI 2.6 contract — Booking Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/booking.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.1  — Kafka conventions (envelope, DLQ, OTel)
+#   ADR-003 §3.4.2  — Authoritative topic catalogue
+#   ADR-004 §3.3    — Money wire format
+#   ADR-005         — Booking saga pattern
+#   NFR-REL-002     — Consumer idempotency via messageId
+#   NFR-REL-007     — DLQ per topic
+#   NFR-REL-011     — Cancellation idempotency
+#   NFR-REL-012     — Revenue split immutability
+#
+# Topics covered in this file:
+#   booking.events          (12 partitions, key=bookingId)
+#   booking.commands        (12 partitions, key=bookingId)
+#   booking.events.dlq      (12 partitions, 14-day retention)
+#   booking.commands.dlq    (12 partitions, 14-day retention)
+#
+# Out of scope (covered by separate file):
+#   booking.refund-requested — ADR-003 §3.4.2; consumed by
+#     payment-service-consumer + disbursement-service-consumer.
+#     Included in Chat 13b (disbursement + ticket domains).
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:booking'
+
+info:
+  title: StagePass — Booking Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Booking domain** Kafka topics.
+
+    **Publisher:** Booking Service (Spring Boot 3 / Java 21).
+    Events are published via the **Outbox pattern** (ADR-005 §3.5, NFR-REL-005)
+    to prevent dual-write failures: the event is written to `booking_outbox`
+    in the same PostgreSQL transaction as the state transition, then relayed
+    to Kafka by a background Outbox Relay component.
+
+    **Delivery guarantee:** At-least-once (acks=all, idempotent producer).
+    Every consumer MUST be idempotent — deduplicate on `messageId` using a
+    short-lived store such as Redis SET NX with a TTL that covers the
+    at-least-once redelivery window (NFR-REL-002).
+
+    **Schema evolution:** Additive only — new optional fields may be added;
+    existing fields may not be removed or have their type changed. Consumers
+    MUST apply the tolerant reader pattern (Kleppmann, DDIA §4).
+
+    **State machine (normal path):**
+    PENDING → SEATS_HELD → PAYMENT_INITIATED → PAYMENT_CONFIRMED →
+    SEATS_COMMITTED → TICKETS_ISSUED → CONFIRMED
+
+    **State machine (compensation path):**
+    CANCELLATION_REQUESTED → REFUND_INITIATED → REFUND_CONFIRMED → CANCELLED
+  contact:
+    name: StagePass Platform Team
+    url: https://github.com/stagepass-aiman/stagepass-docs
+    email: platform@stagepass.internal
+  license:
+    name: Proprietary — StagePass internal
+
+tags:
+  - name: booking
+    description: Booking saga events and commands — ADR-005
+  - name: saga
+    description: Booking saga pattern
+
+defaultContentType: application/json
+
+servers:
+  kafka-local:
+    url: 'kafka:9092'
+    protocol: kafka
+    description: |
+      Apache Kafka via Strimzi — local Docker Compose stack.
+      Override with KAFKA_BOOTSTRAP_SERVERS env var for other environments.
+  kafka-staging:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: Amazon MSK — staging / production
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap endpoint from AWS console / Vault
+
+# ============================================================
+# CHANNELS
+# ============================================================
+
+channels:
+
+  # ----------------------------------------------------------
+  # booking.events
+  # ADR-003 §3.4.2 — partition key: bookingId, 12 partitions,
+  # retention: 7 days
+  # ----------------------------------------------------------
+  booking.events:
+    description: |
+      Booking state-change events published by the Booking Service.
+      Each message represents exactly one transition in the booking
+      state machine. Consumers use `x-event-type` (header) and
+      `eventType` (payload) to discriminate message type.
+
+      **Partition key: bookingId.**
+      All events for one booking land on the same partition in emission
+      order. Consumers within a group observe PENDING → SEATS_HELD →
+      CONFIRMED in strict order. This ordering guarantee is only valid
+      while consumers commit offsets manually and never auto-commit
+      (ADR-003 §3.4.1).
+
+      **Fan-out:** Five independent consumer groups each receive every
+      message (Kafka fan-out at zero additional producer cost):
+        - notification-service-consumer: pushes booking state to WebSocket
+        - analytics-service-consumer:    records GMV/min, bookings/min
+        - fraud-detection-service-consumer: closes fraud scoring loop
+        - disbursement-service-consumer: schedules post-event payouts on CONFIRMED
+        - ticket-service-consumer:       issues signed QR tokens on CONFIRMED
+
+      **BookingConfirmed is the critical event.** It carries an immutable
+      `revenueSplit` snapshot (ADR-004 §3.3, ADR-005 §3.8, NFR-REL-012).
+      The Disbursement Service MUST use these values; it must never
+      recompute from current Admin fee configuration, which may have
+      changed since the booking was made.
+    x-producer: booking-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - notification-service-consumer
+      - analytics-service-consumer
+      - fraud-detection-service-consumer
+      - disbursement-service-consumer
+      - ticket-service-consumer
+    bindings:
+      kafka:
+        topic: booking.events
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingEvent
+      summary: Receive a booking state-change event
+      description: |
+        All five consumer groups share this single channel definition.
+        Each group independently tracks its own consumer offsets — a slow
+        Analytics consumer does not back-pressure the Notification consumer.
+      message:
+        oneOf:
+          - $ref: '#/components/messages/BookingCreated'
+          - $ref: '#/components/messages/BookingSeatsHeld'
+          - $ref: '#/components/messages/BookingPaymentInitiated'
+          - $ref: '#/components/messages/BookingPaymentConfirmed'
+          - $ref: '#/components/messages/BookingSeatsCommitted'
+          - $ref: '#/components/messages/BookingConfirmed'
+          - $ref: '#/components/messages/BookingCancellationRequested'
+          - $ref: '#/components/messages/BookingCancelled'
+          - $ref: '#/components/messages/BookingRefundInitiated'
+          - $ref: '#/components/messages/BookingRefundConfirmed'
+
+  # ----------------------------------------------------------
+  # booking.commands
+  # ADR-003 §3.4.2 — partition key: bookingId, 12 partitions,
+  # retention: 7 days; consumer: booking-service-consumer
+  #
+  # NOTE ON TASK BRIEF vs ADR-003:
+  # The task brief lists consumers as "Seat Inventory, Payment".
+  # ADR-003 §3.4.2 (the locked authority) shows booking-service-consumer.
+  # This is consistent with ADR-005's orchestrated saga design: the
+  # Booking Service orchestrator receives external commands directed at
+  # it (e.g., from Admin, Event Service cascade). Seat Inventory and
+  # Payment are called by the Booking Service via gRPC and REST
+  # respectively — not via this Kafka topic. This file follows ADR-003.
+  # ----------------------------------------------------------
+  booking.commands:
+    description: |
+      Commands directed at the Booking Service saga orchestrator.
+      Published by external actors and consumed by the Booking Service
+      itself (booking-service-consumer), which transitions the booking
+      state machine accordingly.
+
+      **Publishers:**
+        - Event Service: publishes CancelBookingCommand for every active
+          booking when an event is cancelled (fan-out cascade).
+          NFR-PERF-020: all commands for 100 bookings published within 30s.
+        - Admin Service: publishes CancelBookingCommand for manual overrides.
+        - Booking Service itself: publishes CompensateBookingCommand during
+          saga rollback when a step failure requires rolling back a completed
+          prior step.
+
+      **Partition key: bookingId.**
+      Commands for one booking arrive at the same consumer thread in order,
+      preventing race conditions between CancelBookingCommand and an in-flight
+      CONFIRMED state transition.
+
+      **Idempotency:** If a CancelBookingCommand arrives for a booking already
+      in CANCELLED or CANCELLATION_REQUESTED state, the consumer acknowledges
+      and discards the command (NFR-REL-011). No duplicate refund is triggered.
+    x-producer: event-service, admin-service, booking-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - booking-service-consumer
+    bindings:
+      kafka:
+        topic: booking.commands
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingCommand
+      summary: Receive a command for the Booking Service saga orchestrator
+      message:
+        oneOf:
+          - $ref: '#/components/messages/CancelBookingCommand'
+          - $ref: '#/components/messages/CompensateBookingCommand'
+
+  # ----------------------------------------------------------
+  # booking.events.dlq
+  # NFR-REL-007, ADR-003 §3.4.1 — 14-day retention
+  # ----------------------------------------------------------
+  booking.events.dlq:
+    description: |
+      Dead-letter queue for booking.events (NFR-REL-007).
+
+      Messages arrive here after **3 consecutive failed delivery attempts**
+      with exponential backoff (base=100ms, cap=5s, ADR-003 §3.4.1).
+      The x-failure-reason header carries the exception class and message
+      from the final attempt — this is what distinguishes a DLQ message
+      from a live one.
+
+      **Retention: 14 days** (investigation + replay window).
+      **Prometheus alert:** KafkaDLQDepthNonZero fires when depth > 0
+      for > 5 continuous minutes. Runbook: /docs/runbooks/kafka-dlq-depth.md.
+      **Replay:** Admin must be able to replay messages without writing code
+      (Phase 8 tooling requirement).
+
+      The DLQ partition count mirrors the source topic (12) so that
+      per-partition lag metrics remain meaningful.
+    x-original-topic: booking.events
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - booking-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: booking.events.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingEventDLQ
+      summary: Receive a dead-lettered booking event for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredBookingMessage'
+
+  # ----------------------------------------------------------
+  # booking.commands.dlq
+  # NFR-REL-007
+  # ----------------------------------------------------------
+  booking.commands.dlq:
+    description: |
+      Dead-letter queue for booking.commands (NFR-REL-007).
+      Same semantics as booking.events.dlq — see above.
+      A dead-lettered CancelBookingCommand means the Booking Service
+      was unable to initiate cancellation; the booking may be stuck.
+      The KafkaDLQDepthNonZero alert + runbook covers this.
+    x-original-topic: booking.commands
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - booking-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: booking.commands.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingCommandDLQ
+      summary: Receive a dead-lettered booking command for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredBookingMessage'
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+
+components:
+
+  # ----------------------------------------------------------
+  # MESSAGES
+  # ----------------------------------------------------------
+  messages:
+
+    BookingCreated:
+      messageId: BookingCreated
+      name: BookingCreated
+      title: Booking Created
+      summary: A new booking has been created and is in PENDING state.
+      description: |
+        Published by the Booking Service when a customer submits checkout
+        and the Booking record is written to PostgreSQL in PENDING state.
+        This is the first event in the booking saga.
+
+        **Fraud Detection consumer action:** Immediately begin async fraud
+        scoring on this event. NFR-PERF-011 requires the fraud score to be
+        published to fraud.score-results within 10s of this event. Fraud
+        scoring is fire-and-forget — it MUST NOT block the saga.
+
+        **No compensation:** If a downstream step fails, the Booking Service
+        publishes BookingCancellationRequested rather than "un-creating" the
+        booking record. PENDING bookings that never progress are cleaned up
+        by a scheduled reconciliation job.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingCreatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: bookingId — routes all events for this booking to the same partition
+
+    BookingSeatsHeld:
+      messageId: BookingSeatsHeld
+      name: BookingSeatsHeld
+      title: Booking Seats Held
+      summary: All requested seats have been atomically held in Redis.
+      description: |
+        Published after gRPC HoldSeats returns success (ADR-005 Step 1).
+        At this point, the Redis TTL clock is running — seats auto-release
+        after 600s if checkout is not completed (NFR-REL-004).
+
+        **Notification consumer action:** Push a "seats held — complete
+        checkout within 10 minutes" WebSocket event to the customer's
+        userId room with the `heldUntil` timestamp for countdown display.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingSeatsHeldPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingPaymentInitiated:
+      messageId: BookingPaymentInitiated
+      name: BookingPaymentInitiated
+      title: Payment Initiated
+      summary: Payment Service has been called and a payment order created.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingPaymentInitiatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingPaymentConfirmed:
+      messageId: BookingPaymentConfirmed
+      name: BookingPaymentConfirmed
+      title: Payment Confirmed
+      summary: Payment captured. Saga proceeds to CommitSeats.
+      description: |
+        Published after payment.events:payment.captured is consumed by the
+        Booking Service (booking-service-consumer). Real money has moved.
+        The next step (CommitSeats via gRPC) transitions seats HELD → BOOKED
+        under SERIALIZABLE isolation (ADR-006 §3.7, NFR-REL-008).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingPaymentConfirmedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingSeatsCommitted:
+      messageId: BookingSeatsCommitted
+      name: BookingSeatsCommitted
+      title: Seats Committed
+      summary: Seats transitioned from HELD to BOOKED in both Redis and PostgreSQL.
+      description: |
+        Published after gRPC CommitSeats returns success (ADR-005 Step 4).
+        The SERIALIZABLE PostgreSQL transaction has committed. No other booking
+        can claim these seats. This event is consumed by Seat Inventory's
+        seat.state-changes feed (indirectly — CommitSeats triggers a
+        seat.state-changes publish by the Seat Inventory Service).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingSeatsCommittedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingConfirmed:
+      messageId: BookingConfirmed
+      name: BookingConfirmed
+      title: Booking Confirmed
+      summary: |
+        Booking fully confirmed. Triggers ticket issuance, disbursement
+        scheduling, and customer notification.
+      description: |
+        The most consequential event in the booking domain. Five consumer
+        groups act on this simultaneously:
+
+        **ticket-service-consumer:** Issues HMAC-SHA256 signed QR tokens
+        (one per seat). ADR-005 Step 5a.
+
+        **disbursement-service-consumer:** Creates DisbursementSchedule
+        records (Venue + Organiser) with triggerAfter = event.endDateTime + 48h.
+        MUST use `revenueSplit` amounts from this payload — never recompute
+        (NFR-REL-012, ADR-005 §3.8).
+
+        **notification-service-consumer:** Pushes booking confirmation email,
+        SMS, and WebSocket event to userId room. Fire-and-forget — saga does
+        not await this (NFR-AVAIL-001).
+
+        **analytics-service-consumer:** Records confirmed booking for GMV/min
+        and bookings/min Grafana dashboards (NFR-OBS-005).
+
+        **fraud-detection-service-consumer:** Closes the fraud scoring loop;
+        compares final booking state against the earlier fraud score.
+
+        **Revenue split immutability:** The `revenueSplit` object in this
+        payload is computed once at this instant from current Admin fee
+        configuration and the prevailing venueShare rate. It is written to
+        an immutable ledger. Any future refund is computed proportionally
+        from these stored amounts — the Admin fee rate at refund time is
+        irrelevant (ADR-004 §3.3 example, NFR-REL-012).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingConfirmedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingCancellationRequested:
+      messageId: BookingCancellationRequested
+      name: BookingCancellationRequested
+      title: Booking Cancellation Requested
+      summary: Cancellation initiated. The compensation saga begins.
+      description: |
+        Published when a cancellation is initiated regardless of source
+        (Customer self-cancel, Organiser cancel, Admin override, event
+        cancellation cascade). The `cancellationSource` field records
+        the actor for audit and refund policy selection.
+
+        The compensation sequence from this point:
+          1. ReleaseSeats gRPC (HELD → AVAILABLE in Redis + PG)
+          2. Payment Service refund REST call
+          3. VoidTickets (if tickets were issued)
+          4. CancelDisbursementSchedule (if not yet processed)
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingCancellationRequestedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingCancelled:
+      messageId: BookingCancelled
+      name: BookingCancelled
+      title: Booking Cancelled
+      summary: Booking fully cancelled. All compensation steps completed.
+      description: |
+        Terminal cancelled state. All saga compensations have run.
+        Consumers receiving this for an already-cancelled bookingId
+        MUST treat it as a success (no-op) — idempotency (NFR-REL-011).
+
+        **Notification consumer action:** Push "your booking has been
+        cancelled and refund initiated" to the customer's userId room.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingCancelledPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingRefundInitiated:
+      messageId: BookingRefundInitiated
+      name: BookingRefundInitiated
+      title: Refund Initiated
+      summary: Refund has been submitted to the payment provider.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingRefundInitiatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    BookingRefundConfirmed:
+      messageId: BookingRefundConfirmed
+      name: BookingRefundConfirmed
+      title: Refund Confirmed
+      summary: Payment provider has confirmed the refund is processed.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingRefundConfirmedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    CancelBookingCommand:
+      messageId: CancelBookingCommand
+      name: CancelBookingCommand
+      title: Cancel Booking Command
+      summary: |
+        Commands the Booking Service to initiate the cancellation saga for
+        the specified booking.
+      description: |
+        **Event cancellation cascade (ADR-003 §3.4.2 event.events):**
+        When the Event Service publishes event.events:event.cancelled, the
+        Booking Service consumer (booking-service-consumer) publishes one
+        CancelBookingCommand per active booking for that event.
+        NFR-PERF-020: all 100 commands published within 30s.
+
+        **Idempotency:** If the booking is already in CANCELLED or
+        CANCELLATION_REQUESTED state, the consumer acknowledges and discards.
+        No duplicate refund (NFR-REL-011).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/CancelBookingCommandPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: bookingId
+
+    CompensateBookingCommand:
+      messageId: CompensateBookingCommand
+      name: CompensateBookingCommand
+      title: Compensate Booking Command
+      summary: |
+        Internal saga compensation command. Published by the Booking Service
+        orchestrator when a forward step fails and a completed prior step
+        must be rolled back.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/CompensateBookingCommandPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredBookingMessage:
+      name: DeadLetteredBookingMessage
+      title: Dead-Lettered Booking Message
+      summary: |
+        A booking.events or booking.commands message that failed delivery
+        after 3 attempts. Original payload preserved verbatim.
+      description: |
+        Parse the original payload using the `x-event-type` header
+        (copied from the original message) to determine which schema applies.
+        The `x-failure-reason` header carries the exception class and message.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassDLQHeaders'
+      payload:
+        description: |
+          Original message payload, verbatim. Use x-event-type header to
+          determine the applicable schema before attempting to parse fields.
+        type: object
+        additionalProperties: true
+
+  # ----------------------------------------------------------
+  # SCHEMAS
+  # ----------------------------------------------------------
+  schemas:
+
+    # ---- Shared money type (ADR-004 §3.3) ------------------
+    MoneyAmount:
+      type: object
+      description: |
+        Exact monetary amount with ISO-4217 currency code.
+
+        CRITICAL: `amount` is ALWAYS a JSON string — NEVER a JSON number.
+        JSON numbers are IEEE 754 doubles; parsing "1250.0001" as a double
+        corrupts the value at the deserialiser boundary before any business
+        logic runs (ADR-004 §3.3). The receiving service MUST parse the
+        string into its exact decimal type:
+          Java       → BigDecimal
+          TypeScript → decimal.js Decimal
+          Python     → decimal.Decimal
+
+        `amount` and `currency` ALWAYS appear together. No field named
+        `amount` exists without an adjacent `currency`.
+      required:
+        - amount
+        - currency
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: |
+            Exact decimal string, always exactly 4 decimal places.
+            Trailing zeros are preserved ("75.0000", not "75" or "75.0").
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO-4217 three-character currency code. v1.0 uses INR exclusively.
+          example: 'INR'
+
+    # ---- Revenue split snapshot (ADR-004 §3.3, NFR-REL-012) ----
+    RevenueSplit:
+      type: object
+      description: |
+        Immutable revenue split computed at booking confirmation time
+        (ADR-005 §3.8, NFR-REL-012). All money fields follow ADR-004 §3.3.
+
+        Rates are stored alongside amounts so that the Disbursement Service
+        can reconstruct percentages for proportional refund computation without
+        querying current Admin configuration — which may have changed since the
+        booking was made (ADR-004 §3.3, example RevenueSplit event payload).
+
+        Once written to the Kafka event and to the Disbursement ledger,
+        this object is immutable. It must never be recalculated.
+      required:
+        - salePrice
+        - basePrice
+        - gstAmount
+        - platformFee
+        - venueShare
+        - organiserShare
+        - platformFeeRate
+        - venueShareRate
+        - gstRate
+        - computedAt
+      properties:
+        salePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Total amount charged to the customer (basePrice + gstAmount)
+        basePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Pre-GST price (may include surge premium)
+        gstAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: GST computed as basePrice × gstRate
+        platformFee:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Platform fee computed as basePrice × platformFeeRate
+        venueShare:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Venue's share computed as basePrice × venueShareRate
+        organiserShare:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Organiser's remainder = basePrice − platformFee − venueShare
+        platformFeeRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: Platform fee rate at booking time, e.g. "0.0500" for 5%
+          example: '0.0500'
+        venueShareRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: Venue share rate at booking time, e.g. "0.2000" for 20%
+          example: '0.2000'
+        gstRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: GST rate at booking time, e.g. "0.1800" for 18%
+          example: '0.1800'
+        computedAt:
+          type: string
+          format: date-time
+          description: UTC ISO-8601 timestamp when the split was computed. Immutable after.
+
+    # ---- Seat selection (used in booking events) -----------
+    SeatSelection:
+      type: object
+      required:
+        - seatId
+        - sectionId
+        - row
+        - seatNumber
+        - seatType
+        - pricingTierId
+        - priceAtHold
+      properties:
+        seatId:
+          type: string
+          format: uuid
+          description: Non-fungible seat identifier. 12B ≠ 12C (ADR-006 §2.1).
+        sectionId:
+          type: string
+          format: uuid
+        row:
+          type: string
+          example: 'A'
+        seatNumber:
+          type: string
+          example: '12B'
+        seatType:
+          type: string
+          enum: [STANDARD, PREMIUM, ACCESSIBLE]
+        pricingTierId:
+          type: string
+          format: uuid
+        priceAtHold:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: |
+            Surge-adjusted price locked at hold creation time (ADR-005 §3.4 Step 1).
+            The SurgePricingRule is evaluated at hold time; subsequent price changes
+            do not affect this booking.
+
+    # ---- OTel / correlation headers (ADR-003 §3.4.1, §3.6.3) ----
+    StagePassMessageHeaders:
+      type: object
+      description: |
+        Standard Kafka headers carried by every StagePass message (ADR-003 §3.4.1).
+        Headers are Kafka message headers, not payload fields — they can be
+        inspected by brokers and consumers without parsing the JSON body.
+
+        OTel context (x-traceparent, x-tracestate) provides unbroken distributed
+        traces across Kafka hops in Jaeger (NFR-OBS-003, NFR-OBS-004).
+        Injected by the OTel Kafka instrumentation (Java: OTel agent; Node:
+        @opentelemetry/instrumentation-kafkajs; Python: opentelemetry-sdk manual).
+      required:
+        - x-event-type
+        - x-correlation-id
+        - x-traceparent
+        - x-produced-at
+        - x-schema-version
+      properties:
+        x-event-type:
+          type: string
+          description: |
+            Event type discriminator — e.g. "booking.confirmed".
+            Consumers SHOULD use this header as a fast discriminator
+            before deserialising the JSON body.
+          example: 'booking.confirmed'
+        x-correlation-id:
+          type: string
+          format: uuid
+          description: |
+            Same as X-Correlation-Id from the originating HTTP request.
+            Propagated through all downstream Kafka hops and gRPC calls.
+            Enables log correlation across services (NFR-OBS-001, NFR-OBS-004).
+          example: 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+        x-traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          description: |
+            W3C TraceContext traceparent (spec: https://www.w3.org/TR/trace-context/).
+            Consumer extracts this header and creates a child span linked to the
+            producer span — giving an unbroken trace across the Kafka hop in Jaeger.
+          example: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+        x-tracestate:
+          type: string
+          description: |
+            W3C TraceContext tracestate. Vendor-specific trace state.
+            May be empty string if no vendor-specific state is propagated.
+          example: 'vendor=abc123'
+        x-produced-at:
+          type: string
+          format: date-time
+          description: UTC ISO-8601 timestamp when the Outbox Relay published this message.
+          example: '2025-09-01T14:32:00.000Z'
+        x-schema-version:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          description: |
+            Semver schema version matching the `schemaVersion` payload field.
+            Consumers must apply the tolerant reader pattern: tolerate unknown
+            fields, never fail on new optional fields (ADR-003 §3.4.1,
+            Kleppmann DDIA §4).
+          example: '1.0.0'
+
+    # ---- DLQ headers (NFR-REL-007, ADR-003 §3.4.1) --------
+    StagePassDLQHeaders:
+      description: |
+        Standard headers plus DLQ-specific fields. The presence of
+        `x-failure-reason` is the signal that a message is dead-lettered.
+      allOf:
+        - $ref: '#/components/schemas/StagePassMessageHeaders'
+        - type: object
+          required:
+            - x-failure-reason
+            - x-original-topic
+            - x-delivery-attempt
+          properties:
+            x-failure-reason:
+              type: string
+              description: |
+                Exception class and message from the final failed delivery attempt.
+                Format: "<ExceptionClass>: <human-readable message>".
+                This is the first field to read when investigating a DLQ message.
+              example: 'org.springframework.kafka.listener.ListenerExecutionFailedException: NPE in BookingEventConsumer'
+            x-original-topic:
+              type: string
+              description: The topic from which this message was dead-lettered.
+              example: 'booking.events'
+            x-original-partition:
+              type: integer
+              minimum: 0
+              description: Kafka partition of the original message.
+              example: 7
+            x-original-offset:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Kafka offset of the original message in its original partition.
+              example: 1048576
+            x-failure-timestamp:
+              type: string
+              format: date-time
+              description: UTC timestamp of the final failed delivery attempt.
+            x-delivery-attempt:
+              type: integer
+              description: |
+                Delivery attempts before DLQ publication. ADR-003 §3.4.1 mandates
+                exactly 3 attempts with exponential backoff (base=100ms, cap=5s).
+              const: 3
+              example: 3
+
+    # ---- Payload schemas -----------------------------------
+
+    BookingCreatedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - eventId
+        - venueId
+        - seats
+        - totalAmount
+        - idempotencyKey
+        - status
+        - createdAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: |
+            Unique ID for this Kafka message. Consumers MUST deduplicate on this
+            field (NFR-REL-002). Recommended: Redis SET NX messageId "1" EX 3600.
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.created'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        seats:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/SeatSelection'
+        totalAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Total payable by customer (basePrice + GST + any surge)
+        idempotencyKey:
+          type: string
+          format: uuid
+          description: |
+            Client-supplied Idempotency-Key header from POST /bookings (NFR-REL-001).
+            The Booking Service uses this to return the same response on retry
+            without re-executing the saga.
+        status:
+          type: string
+          const: 'PENDING'
+        createdAt:
+          type: string
+          format: date-time
+
+    BookingSeatsHeldPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - eventId
+        - heldSeats
+        - holdId
+        - heldUntil
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.seats-held'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        heldSeats:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: object
+            required: [seatId, redisKey]
+            properties:
+              seatId:
+                type: string
+                format: uuid
+              redisKey:
+                type: string
+                description: |
+                  Redis key holding this seat. Format: seat:{eventId}:{seatId}
+                  (ADR-006 §3.10). Exposed for observability and debugging only.
+                example: 'seat:7e9d3c2b-18ae-4f1a-b73e-8dcc5432a100:a1b2c3d4-...'
+        holdId:
+          type: string
+          format: uuid
+          description: Logical hold group ID for all seats in this booking.
+        heldUntil:
+          type: string
+          format: date-time
+          description: |
+            Redis TTL expiry timestamp (createdAt + 600s, NFR-REL-004).
+            Notification Service displays this as the checkout countdown timer.
+            If checkout is not completed by this time, Redis TTL expiry auto-releases
+            all seats with no application action required.
+        status:
+          type: string
+          const: 'SEATS_HELD'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingPaymentInitiatedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - paymentOrderId
+        - totalAmount
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.payment-initiated'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        paymentOrderId:
+          type: string
+          format: uuid
+          description: Payment order ID returned by Payment Service (Razorpay order ID wrapper)
+        totalAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        status:
+          type: string
+          const: 'PAYMENT_INITIATED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingPaymentConfirmedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - paymentOrderId
+        - amountCaptured
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.payment-confirmed'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        paymentOrderId:
+          type: string
+          format: uuid
+        amountCaptured:
+          $ref: '#/components/schemas/MoneyAmount'
+        status:
+          type: string
+          const: 'PAYMENT_CONFIRMED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingSeatsCommittedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - eventId
+        - committedSeatIds
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.seats-committed'
+        bookingId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        committedSeatIds:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: string
+            format: uuid
+          description: All seats now in BOOKED state in both Redis and PostgreSQL.
+        status:
+          type: string
+          const: 'SEATS_COMMITTED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingConfirmedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - eventId
+        - venueId
+        - organiserId
+        - seats
+        - totalAmount
+        - revenueSplit
+        - idempotencyKey
+        - status
+        - confirmedAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.confirmed'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        seats:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/SeatSelection'
+        totalAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        revenueSplit:
+          $ref: '#/components/schemas/RevenueSplit'
+        idempotencyKey:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: 'CONFIRMED'
+        confirmedAt:
+          type: string
+          format: date-time
+
+    BookingCancellationRequestedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - eventId
+        - cancellationReason
+        - cancellationSource
+        - refundEntitlement
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.cancellation-requested'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        cancellationReason:
+          type: string
+          maxLength: 500
+        cancellationSource:
+          type: string
+          enum:
+            - CUSTOMER
+            - ORGANISER
+            - ADMIN
+            - EVENT_CANCELLED
+            - VENUE_SUSPENDED
+          description: Actor or system event that triggered the cancellation.
+        refundEntitlement:
+          type: object
+          description: |
+            Snapshot of the CancellationPolicy evaluation at cancellation time.
+            Used by the compensation saga to compute the refund amount.
+            The policy is immutable after first ticket sold (PRD §7.1).
+          required:
+            - refundPercentage
+            - refundAmount
+          properties:
+            refundPercentage:
+              type: string
+              pattern: '^\d+\.\d{4}$'
+              description: Fraction of totalAmount refundable (0.0000 to 1.0000)
+              example: '0.5000'
+            refundAmount:
+              $ref: '#/components/schemas/MoneyAmount'
+        status:
+          type: string
+          const: 'CANCELLATION_REQUESTED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingCancelledPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - eventId
+        - refundAmount
+        - status
+        - cancelledAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.cancelled'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        refundAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Actual refund amount processed (may be zero for no-refund policies).
+        status:
+          type: string
+          const: 'CANCELLED'
+        cancelledAt:
+          type: string
+          format: date-time
+
+    BookingRefundInitiatedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - refundId
+        - refundAmount
+        - paymentOrderId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.refund-initiated'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        refundId:
+          type: string
+          format: uuid
+          description: Platform-internal refund record ID
+        refundAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        paymentOrderId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: 'REFUND_INITIATED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    BookingRefundConfirmedPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - eventType
+        - bookingId
+        - customerId
+        - refundId
+        - refundAmount
+        - providerRefundId
+        - status
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        eventType:
+          type: string
+          const: 'booking.refund-confirmed'
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        refundId:
+          type: string
+          format: uuid
+        refundAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        providerRefundId:
+          type: string
+          description: |
+            Razorpay refund ID. Used for reconciliation and finance audit trail.
+        status:
+          type: string
+          const: 'REFUND_CONFIRMED'
+        occurredAt:
+          type: string
+          format: date-time
+
+    CancelBookingCommandPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - commandType
+        - bookingId
+        - reason
+        - source
+        - issuedBy
+        - issuedAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        commandType:
+          type: string
+          const: 'cancel-booking'
+        bookingId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          maxLength: 500
+        source:
+          type: string
+          enum:
+            - ADMIN
+            - EVENT_CANCELLED
+            - VENUE_SUSPENDED
+            - ORGANISER
+        issuedBy:
+          type: string
+          format: uuid
+          description: userId (Admin/Organiser) or serviceId (event-service) that issued the command.
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            Present when source is EVENT_CANCELLED or VENUE_SUSPENDED.
+            Identifies the event or venue whose state triggered this cascade.
+        issuedAt:
+          type: string
+          format: date-time
+
+    CompensateBookingCommandPayload:
+      type: object
+      required:
+        - messageId
+        - schemaVersion
+        - commandType
+        - bookingId
+        - compensationStep
+        - failedForwardStep
+        - occurredAt
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+        commandType:
+          type: string
+          const: 'compensate-booking'
+        bookingId:
+          type: string
+          format: uuid
+        compensationStep:
+          type: string
+          enum:
+            - RELEASE_SEATS       # HELD → AVAILABLE in Redis + PG
+            - REVERSE_PAYMENT     # Initiate refund via Payment Service REST
+            - VOID_TICKETS        # Mark issued tickets as VOIDED
+            - CANCEL_DISBURSEMENT # Cancel scheduled disbursement records
+          description: Which compensation action the Booking Service must execute.
+        failedForwardStep:
+          type: string
+          description: The saga forward step that failed, for audit and alerting.
+          example: 'COMMIT_SEATS'
+        failureReason:
+          type: string
+          description: Exception class and brief message from the failed step.
+          example: 'io.grpc.StatusRuntimeException: UNAVAILABLE: seat-inventory-service unreachable'
+        occurredAt:
+          type: string
+          format: date-time
