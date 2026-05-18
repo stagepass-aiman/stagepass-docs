@@ -1,0 +1,1228 @@
+# ============================================================
+# waitlist_async.yaml
+#
+# AsyncAPI 2.6 contract — Waitlist Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/waitlist_async.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Authoritative topic catalogue (waitlist domain table)
+#   ADR-005 §3.4    — Payment-failure compensation path: Booking Service
+#                     publishes waitlist.commands when seats are released
+#   ADR-004 §3.3    — Money wire format (not directly in these payloads;
+#                     waitlist does not handle money — booking flow does)
+#   NFR-REL-002     — messageId in every payload (consumer idempotency)
+#   NFR-REL-004     — Hold TTL = 600s (Redis); offer TTL = 15 minutes
+#   NFR-REL-007     — DLQ per topic
+#   PRD §7.6        — Waitlist management: sold-out → join → offer → accept/expire
+#   PRD FR-C-007    — Customer waitlist feature acceptance criteria
+#   PRD FR-P-010    — Auto-compensation: offer TTL expiry promotes next member
+#
+# WAITLIST FLOW (PRD §7.6):
+#   1. Event is SOLD_OUT (Redis seat count reaches zero).
+#   2. Customer calls POST /waitlist/{eventId}/join (REST, Waitlist Service).
+#      Waitlist Service adds entry to Redis sorted set (score = join timestamp).
+#      FIFO ordering guaranteed. Waitlist Service publishes WaitlistJoined
+#      to waitlist.events → Notification Service pushes confirmation + position.
+#   3. Seat is released (booking cancelled, payment failed, hold expired).
+#      Booking Service (or Seat Inventory on TTL expiry) publishes
+#      NotifyNextMemberCommand to waitlist.commands.
+#   4. Waitlist Service consumer reads top member from Redis sorted set,
+#      creates a WaitlistOffer (offerId, seatId, TTL=15min), stores in Redis.
+#      Publishes WaitlistOfferCreated to waitlist.events.
+#   5. Notification Service consumer pushes offer to user:{customerId} room
+#      via WebSocket + email (time-limited: 15-minute countdown).
+#   6a. Customer accepts (REST POST /waitlist/offers/{offerId}/accept):
+#       Waitlist Service removes member from Redis sorted set, redirects to
+#       standard booking flow with offered seat pre-selected.
+#   6b. Offer expires (Redis keyspace notification or scheduled TTL check):
+#       Waitlist Service publishes WaitlistOfferExpired to waitlist.offer-expired.
+#       Waitlist Service consumer (same service, self-loop pattern) removes
+#       the expired member from the queue and promotes the next member by
+#       publishing NotifyNextMemberCommand back to waitlist.commands, or
+#       directly executing the offer creation inline.
+#
+# SELF-LOOP PATTERN (waitlist.offer-expired):
+#   The Waitlist Service is both publisher and sole consumer of
+#   waitlist.offer-expired. This is a deliberate architectural choice: offer
+#   expiry is an asynchronous event (Redis TTL or scheduler) that must not be
+#   processed in the HTTP request path. Using Kafka externalises the expiry
+#   trigger, making it observable (DLQ monitoring, Grafana lag metric) and
+#   idempotent (messageId deduplication prevents double-promotion on
+#   at-least-once redelivery). The alternative — a direct in-process callback
+#   on Redis keyspace notification — is not durable across service restarts.
+#
+# WHY SEPARATE waitlist.offer-expired FROM waitlist.commands:
+#   waitlist.commands is partitioned by eventId (all operations for an event
+#   on one partition). waitlist.offer-expired is partitioned by customerId
+#   (offer expiry is per-customer, not per-event). Mixing the two would
+#   require both partition key strategies on the same topic, which is not
+#   possible. The key choice matters: customerId partitioning ensures all
+#   offer expiry events for one customer land on the same consumer thread,
+#   preventing a race between an accept and an expiry event for the same offer.
+#
+# Topics covered:
+#   waitlist.commands          (6 partitions, key=eventId, 7-day retention)
+#   waitlist.events            (6 partitions, key=eventId, 7-day retention)
+#   waitlist.offer-expired     (6 partitions, key=customerId, 1-day retention)
+#   waitlist.commands.dlq      (6 partitions, 14-day retention)
+#   waitlist.events.dlq        (6 partitions, 14-day retention)
+#   waitlist.offer-expired.dlq (6 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design (Chat 13c)
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:waitlist'
+
+info:
+  title: StagePass — Waitlist Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Waitlist domain** Kafka topics.
+
+    **Publisher of waitlist.commands:**
+    Booking Service (Spring Boot 3 / Java 21) — publishes NotifyNextMemberCommand
+    when a seat is released due to booking cancellation or payment failure
+    (ADR-005 §3.4 payment-failure compensation path).
+    Seat Inventory Service (Spring Boot 3 / Java 21) — publishes
+    NotifyNextMemberCommand when a Redis hold TTL expires (NFR-REL-004).
+    Waitlist Service itself — publishes CancelEventWaitlistCommand or
+    NotifyNextMemberCommand as part of the offer-expired self-loop.
+
+    **Publisher of waitlist.events:**
+    Waitlist Service (NestJS / TypeScript) — publishes state-change events
+    consumed by the Notification Service for WebSocket + email delivery.
+    Events flow: WaitlistJoined → WaitlistOfferCreated →
+    WaitlistOfferAccepted or WaitlistMemberRemoved.
+
+    **Publisher of waitlist.offer-expired:**
+    Waitlist Service (NestJS / TypeScript) — publishes when a WaitlistOffer
+    TTL expires (detected via Redis keyspace notification `NOTIFY_KEYSPACE_EVENTS Kx`
+    on key `waitlist:offer:{offerId}`). The Waitlist Service is also the sole
+    consumer (self-loop), triggering next-member promotion. This externalises the
+    expiry event to Kafka for durability and observability (ADR-003 §3.4.1 DLQ
+    monitoring, Grafana consumer lag metric).
+
+    **Partition key rationale:**
+    waitlist.commands and waitlist.events: partitioned by `eventId`. All waitlist
+    operations for one event land on the same partition, preventing races between
+    concurrent seat-released triggers for the same event (e.g., two seats released
+    simultaneously should produce two sequential offer cycles, not two simultaneous
+    ones that both pick the same top member).
+    waitlist.offer-expired: partitioned by `customerId`. Offer expiry is per-customer.
+    Keying by customerId ensures all offer lifecycle events for one customer
+    (offer created → offer expired) land on the same consumer thread, preventing
+    a race between a late-arriving accept and an in-flight expiry event. If both
+    arrive in the same consumer thread, the first one wins and the second is
+    discarded via offer state check.
+
+    **T3 tier (ADR-002):** Waitlist Service has 99.0% SLO. If the Waitlist Service
+    is down, the waitlist.commands consumer is unavailable. Seat releases during
+    this window accumulate as unprocessed Kafka messages (consumer group lag
+    increases). On recovery, the consumer processes the backlog in order per
+    event partition — no message is lost, offers are created with a slight delay.
+    DLQ alert fires at 5-minute depth > 0 regardless of service tier.
+  contact:
+    name: StagePass Platform Team
+    url: https://github.com/stagepass-aiman/stagepass-docs
+    email: platform@stagepass.internal
+  license:
+    name: Proprietary — StagePass internal
+
+tags:
+  - name: waitlist
+    description: Waitlist queue management and offer lifecycle — PRD §7.6
+  - name: compensation
+    description: Offer-expiry self-loop and next-member promotion
+
+defaultContentType: application/json
+
+servers:
+  kafka-local:
+    url: 'kafka:9092'
+    protocol: kafka
+    description: Apache Kafka (Strimzi) — local Docker Compose stack.
+  kafka-staging:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: Amazon MSK — staging / production
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap endpoint
+
+# ============================================================
+# CHANNELS
+# ============================================================
+
+channels:
+
+  # ----------------------------------------------------------
+  # waitlist.commands
+  # ADR-003 §3.4.2 — 6 partitions, key=eventId, 7-day retention
+  # Publishers: Booking Service, Seat Inventory Service, Waitlist Service
+  # Consumer:   waitlist-service-consumer
+  # ----------------------------------------------------------
+  waitlist.commands:
+    description: |
+      Commands directed at the Waitlist Service.
+
+      **NotifyNextMemberCommand** (primary command):
+      Published by the Booking Service when a booking is cancelled or payment
+      fails and seats are released (ADR-005 §3.4 compensation path):
+        `BS->>K: waitlist.commands:notify-next (eventId, releasedSeatIds[])`
+      Also published by the Seat Inventory Service when a Redis hold TTL expires
+      (NFR-REL-004) and the released seat belongs to an event with waitlisted
+      customers.
+      The Waitlist Service consumer:
+        1. Checks the Redis sorted set for eventId — is there a waitlisted member?
+        2. If yes: atomically pops the top member (lowest score = earliest join).
+        3. Creates a WaitlistOffer: `SET waitlist:offer:{offerId} NX EX 900`
+           (900s = 15-minute TTL per PRD FR-P-010 / PRD §7.6).
+        4. Publishes WaitlistOfferCreated to waitlist.events.
+        5. Idempotency: if an offer is already active for this event
+           (Redis key exists), no duplicate offer is created.
+
+      **CancelEventWaitlistCommand**:
+      Published by the Booking Service (consuming event.events:event.cancelled)
+      to purge all waitlist entries for a cancelled event. The Waitlist
+      Service consumer deletes the Redis sorted set for the event and publishes
+      WaitlistMemberRemoved for each affected customer (so Notification Service
+      can push cancellation notices).
+
+      **Partition key: eventId.**
+      All commands for one event land on the same partition. A NotifyNextMember
+      and a CancelEventWaitlist for the same event are guaranteed to be processed
+      in order by the same consumer thread — preventing a race where next-member
+      promotion begins after the event is already cancelled.
+
+      **6 partitions:** Waitlist operations are relatively low-frequency
+      compared to booking/seat domains. 6 partitions (matching waitlist.events)
+      ensures symmetric consumer group sizing.
+
+      **7-day retention:** Provides adequate replay headroom for Waitlist Service
+      outages up to 7 days without losing seat-release triggers.
+    x-producer: booking-service, seat-inventory-service, waitlist-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - waitlist-service-consumer
+    bindings:
+      kafka:
+        topic: waitlist.commands
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistCommand
+      summary: Receive a waitlist command
+      description: |
+        The Waitlist Service consumer discriminates on `x-event-type` header
+        before dispatching to the appropriate handler. Unknown command types
+        are dead-lettered (tolerant reader applies to unknown fields, not
+        unknown types — ADR-003 §3.4.1).
+      message:
+        oneOf:
+          - $ref: '#/components/messages/NotifyNextMemberCommand'
+          - $ref: '#/components/messages/CancelEventWaitlistCommand'
+
+  # ----------------------------------------------------------
+  # waitlist.events
+  # ADR-003 §3.4.2 — 6 partitions, key=eventId, 7-day retention
+  # Publisher:  Waitlist Service
+  # Consumer:   notification-service-consumer
+  # ----------------------------------------------------------
+  waitlist.events:
+    description: |
+      Waitlist state-change events published by the Waitlist Service.
+      Consumed exclusively by the Notification Service
+      (notification-service-consumer).
+
+      **Notification Service consumer actions per event type:**
+
+      WaitlistJoined:
+        Push WebSocket event to user:{customerId} room:
+          `{ type: "waitlist.joined", eventId, position, estimatedWait }`
+        Send confirmation email: "You're #N in line for [event name]."
+
+      WaitlistOfferCreated:
+        Push WebSocket event to user:{customerId} room (time-sensitive!):
+          `{ type: "waitlist.offer", offerId, eventId, seatId, expiresAt }`
+        Send offer email with 15-minute countdown and accept/decline CTA.
+        This is the highest-priority notification in the waitlist flow —
+        the customer must see it within seconds of offer creation, or the
+        TTL burns while they are unaware.
+
+      WaitlistOfferAccepted:
+        Push WebSocket event to user:{customerId} room:
+          `{ type: "waitlist.offer.accepted", offerId, eventId }`
+        No email required (customer is already in the booking flow).
+
+      WaitlistOfferDeclined:
+        Push WebSocket event to user:{customerId} room:
+          `{ type: "waitlist.offer.declined", offerId, eventId }`
+        No follow-up notification required.
+
+      WaitlistMemberRemoved:
+        Published when a member is removed due to event cancellation.
+        Push WebSocket event to user:{customerId} room:
+          `{ type: "waitlist.removed", eventId, reason: "EVENT_CANCELLED" }`
+        Send cancellation email: "The event has been cancelled. Your waitlist
+        entry has been removed."
+
+      **Partition key: eventId.**
+      All state-change events for one event land on the same partition.
+      The Notification Service consumer observes WaitlistJoined →
+      WaitlistOfferCreated in order for a given event. This prevents a
+      notification race where an offer push arrives before the join
+      confirmation.
+
+      **7-day retention:** Matches waitlist.commands. The Notification Service
+      can replay from this topic to re-send missed notifications (e.g., after
+      an email provider outage). Replay is safe due to messageId deduplication
+      in the Notification Service.
+    x-producer: waitlist-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - notification-service-consumer
+    bindings:
+      kafka:
+        topic: waitlist.events
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistEvent
+      summary: Receive a waitlist state-change event
+      message:
+        oneOf:
+          - $ref: '#/components/messages/WaitlistJoined'
+          - $ref: '#/components/messages/WaitlistOfferCreated'
+          - $ref: '#/components/messages/WaitlistOfferAccepted'
+          - $ref: '#/components/messages/WaitlistOfferDeclined'
+          - $ref: '#/components/messages/WaitlistMemberRemoved'
+
+  # ----------------------------------------------------------
+  # waitlist.offer-expired
+  # ADR-003 §3.4.2 — 6 partitions, key=customerId, 1-day retention
+  # Publisher:  Waitlist Service
+  # Consumer:   waitlist-service-consumer (SELF-LOOP — see file header)
+  # ----------------------------------------------------------
+  waitlist.offer-expired:
+    description: |
+      Published by the **Waitlist Service** when a WaitlistOffer TTL expires.
+      Consumed by the **Waitlist Service itself** (waitlist-service-consumer).
+      This is an intentional self-loop pattern (see file header for rationale).
+
+      **Expiry detection mechanism:**
+      The Waitlist Service subscribes to Redis keyspace notifications
+      (`NOTIFY_KEYSPACE_EVENTS Kx`) on keys matching `waitlist:offer:*`.
+      When a key expires, Redis emits a `__keyevent@0__:expired` notification.
+      The Waitlist Service detects this event, extracts the offerId from the
+      key name, and publishes WaitlistOfferExpired to this topic. This
+      externalises the expiry into Kafka for durability: if the NestJS process
+      crashes immediately after detecting the expiry, the Kafka message ensures
+      the promotion still happens on restart.
+
+      **Consumer action (next-member promotion):**
+      1. Idempotency: check `waitlist:offer-processed:{offerId}` in Redis.
+         If present (SET NX hit) → this expiry was already processed → skip.
+      2. Verify the offer is still in PENDING state in Waitlist Service DB.
+         If already ACCEPTED or DECLINED → skip (customer beat the expiry).
+      3. Mark offer as EXPIRED.
+      4. Pop the next member from the Redis sorted set for this eventId.
+      5. If another member exists: create a new WaitlistOffer (SET NX EX 900),
+         publish WaitlistOfferCreated to waitlist.events.
+      6. If no more members: log and no-op.
+      7. SET `waitlist:offer-processed:{offerId}` EX 86400 (idempotency key TTL).
+
+      **Race condition — accept vs expiry:**
+      The Redis SET NX on the idempotency key ensures that if the customer
+      accepts the offer at the same moment the expiry fires, only one path
+      succeeds. The offer state check in step 2 provides a second guard.
+      Partition key=customerId ensures both events land on the same consumer
+      thread, providing sequential processing within a partition.
+
+      **1-day retention:** Offer expiry events are transient. After 1 day,
+      an un-replayed expiry event cannot usefully drive promotion (the
+      waitlist state has evolved, the offer is long gone). DLQ replay within
+      1 day is safe; post-1-day replay should be discarded.
+    x-producer: waitlist-service
+    x-kafka-partition-key: customerId
+    x-consumer-groups:
+      - waitlist-service-consumer
+    bindings:
+      kafka:
+        topic: waitlist.offer-expired
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 86400000      # 1 day — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistOfferExpired
+      summary: Receive a waitlist offer expiry event (self-loop; triggers next-member promotion)
+      message:
+        $ref: '#/components/messages/WaitlistOfferExpired'
+
+  # ----------------------------------------------------------
+  # DLQ CHANNELS — NFR-REL-007
+  # ----------------------------------------------------------
+
+  waitlist.commands.dlq:
+    description: |
+      Dead-letter queue for `waitlist.commands` (NFR-REL-007).
+      A dead-lettered NotifyNextMemberCommand means a seat was released
+      but no offer was sent to the next waitlist member. The seat may be
+      available in the booking flow but not offered to waitlisted customers.
+      Operational impact: medium — customers on the waitlist miss their
+      position-based offer. The seat may still be booked by a non-waitlisted
+      customer. KafkaDLQDepthNonZero alert fires.
+      Runbook: /docs/runbooks/kafka-dlq-depth.md
+      Replay: safe after Waitlist Service recovery. Idempotency guard prevents
+      double-offer if the consumer partially processed the original message.
+    x-original-topic: waitlist.commands
+    x-failure-reason-header: x-failure-reason
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - waitlist-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: waitlist.commands.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistCommandDLQ
+      summary: Receive a dead-lettered waitlist command for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredWaitlistMessage'
+
+  waitlist.events.dlq:
+    description: |
+      Dead-letter queue for `waitlist.events` (NFR-REL-007).
+      A dead-lettered WaitlistOfferCreated means the Notification Service
+      failed to push the offer to the customer. The customer is unaware of
+      their offer and it will expire unclaimed. Impact: medium — the waitlist
+      position is fairly held, but the customer experience is broken.
+      KafkaDLQDepthNonZero alert fires.
+      Replay within the offer TTL window (15 minutes from event timestamp)
+      is meaningful; post-TTL replay should skip sending (offer already expired).
+    x-original-topic: waitlist.events
+    x-failure-reason-header: x-failure-reason
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - waitlist-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: waitlist.events.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistEventDLQ
+      summary: Receive a dead-lettered waitlist event for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredWaitlistMessage'
+
+  waitlist.offer-expired.dlq:
+    description: |
+      Dead-letter queue for `waitlist.offer-expired` (NFR-REL-007).
+      A dead-lettered WaitlistOfferExpired means the Waitlist Service failed
+      to promote the next waitlist member after an offer expired. The waitlist
+      queue stalls — no further offers are sent for this event until the DLQ
+      is replayed or a new NotifyNextMemberCommand arrives (e.g., from another
+      seat release). Impact: medium — waitlist members are not promoted in
+      time, but they remain queued and will be served on next trigger.
+      KafkaDLQDepthNonZero alert fires.
+      Replay: safe. Idempotency guard (Redis SET NX on offerId) prevents
+      double-promotion even if both the original message and the replayed
+      DLQ message are processed.
+    x-original-topic: waitlist.offer-expired
+    x-failure-reason-header: x-failure-reason
+    x-kafka-partition-key: customerId
+    x-consumer-groups:
+      - waitlist-offer-expired-dlq-consumer
+    bindings:
+      kafka:
+        topic: waitlist.offer-expired.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveWaitlistOfferExpiredDLQ
+      summary: Receive a dead-lettered offer-expired event for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredWaitlistMessage'
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+
+components:
+
+  messages:
+
+    # --------------------------------------------------------
+    # waitlist.commands messages
+    # --------------------------------------------------------
+
+    NotifyNextMemberCommand:
+      messageId: NotifyNextMemberCommand
+      name: NotifyNextMemberCommand
+      title: Notify Next Waitlist Member
+      summary: >
+        Command to offer released seat(s) to the top waitlist member for an event.
+      description: |
+        Published by the Booking Service or Seat Inventory Service when one
+        or more seats transition to AVAILABLE on an event that has waitlisted
+        customers. The Waitlist Service consumer atomically pops the top member
+        from the Redis sorted set and creates a time-limited offer (TTL = 900s).
+
+        **Idempotency guard:** The Waitlist Service checks
+        `waitlist:active-offer:{eventId}:{seatId}` in Redis before creating a
+        new offer. If an active offer already exists for this seat, the command
+        is acknowledged and discarded — prevents double-offer on duplicate delivery.
+
+        **Seat matching:** `releasedSeatIds` is informational. The Waitlist
+        Service matches the released seat type to the top member's `seatPreference`
+        where possible. If no preference match exists, the seat is offered to the
+        top-of-queue member regardless of preference (FIFO takes priority).
+
+        **Source attribution:** `releasedBy` indicates whether the release came
+        from a booking cancellation (BOOKING_CANCELLED), payment failure
+        (PAYMENT_FAILED), hold TTL expiry (HOLD_EXPIRED), or event cancellation
+        reversal (BOOKING_REINSTATED). Useful for Grafana analytics and runbook
+        diagnostics.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/NotifyNextMemberPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    CancelEventWaitlistCommand:
+      messageId: CancelEventWaitlistCommand
+      name: CancelEventWaitlistCommand
+      title: Cancel Event Waitlist
+      summary: >
+        Command to purge all waitlist entries for a cancelled event.
+      description: |
+        Published by the Booking Service when it consumes
+        `event.events:event.cancelled` (ADR-005 §4.3 event cancellation cascade).
+        The Waitlist Service consumer:
+          1. Reads all members of the Redis sorted set for eventId.
+          2. For each member: publishes WaitlistMemberRemoved to waitlist.events
+             (Notification Service pushes cancellation notice).
+          3. Deletes the Redis sorted set: DEL waitlist:{eventId}.
+          4. Expires any active offers for this event: DEL waitlist:offer:* for eventId.
+        Idempotency: if the sorted set is empty (already purged), the consumer
+        returns success. No duplicate WaitlistMemberRemoved events are published.
+        This satisfies NFR-REL-011 (cancellation cascade idempotency).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/CancelEventWaitlistPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    # --------------------------------------------------------
+    # waitlist.events messages
+    # --------------------------------------------------------
+
+    WaitlistJoined:
+      messageId: WaitlistJoined
+      name: WaitlistJoined
+      title: Customer Joined Waitlist
+      summary: A Customer has been added to the waitlist for a sold-out event.
+      description: |
+        Published by the Waitlist Service after writing the entry to the Redis
+        sorted set (score = epoch ms of join timestamp for FIFO ordering).
+        The Notification Service consumer pushes a WebSocket confirmation to
+        user:{customerId} with the customer's queue position. Position is
+        approximate — members ahead may leave between event emission and
+        WebSocket delivery.
+
+        **Join idempotency (REST layer):** The Waitlist Service REST endpoint
+        POST /waitlist/{eventId}/join is idempotent per NFR-REL-001: a Customer
+        already on the waitlist returns their current position without a
+        duplicate Redis entry. No duplicate WaitlistJoined event is published
+        for repeat joins.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistJoinedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    WaitlistOfferCreated:
+      messageId: WaitlistOfferCreated
+      name: WaitlistOfferCreated
+      title: Waitlist Offer Created
+      summary: A time-limited seat offer has been created for the top waitlist member.
+      description: |
+        Published by the Waitlist Service after atomically popping the top member
+        from the Redis sorted set and setting `waitlist:offer:{offerId}` with TTL=900s.
+        This is the most time-sensitive event in the waitlist flow.
+
+        **Notification Service consumer action (time-critical):**
+        Must push to user:{customerId} WebSocket room and send offer email
+        within the p99 Kafka consumer lag budget. The customer has 15 minutes
+        (expiresAt) from offer creation — not from WebSocket delivery.
+        Slow delivery burns the customer's window. Consumer lag on waitlist.events
+        is an operational SLO concern (Grafana: NFR-OBS-005).
+
+        **seatId and seatLabel** are included so the Notification Service
+        can display "Row A, Seat 12" in the WebSocket push without a synchronous
+        call to the Seat Inventory Service.
+
+        **expiresAt** must be displayed as a countdown timer in the storefront
+        WebSocket push. The storefront subscribes to user:{customerId} room for
+        this event.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistOfferCreatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    WaitlistOfferAccepted:
+      messageId: WaitlistOfferAccepted
+      name: WaitlistOfferAccepted
+      title: Waitlist Offer Accepted
+      summary: A Customer has accepted the seat offer and entered the booking flow.
+      description: |
+        Published by the Waitlist Service when the Customer calls
+        POST /waitlist/offers/{offerId}/accept. At this point:
+          - The Customer has been removed from the Redis sorted set.
+          - A `bookingRedirectToken` has been issued to pre-select the seat.
+          - The Seat Inventory Service will hold the seat when the Customer
+            submits the booking (standard flow, gRPC HoldSeats).
+        The Notification Service consumer pushes a confirmation WebSocket event.
+        No email is sent — the Customer is already active in the browser.
+
+        **Idempotency:** A second accept for the same offerId returns the
+        existing bookingRedirectToken without a duplicate WaitlistOfferAccepted
+        event. The Waitlist Service deduplicates on offerId.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistOfferAcceptedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    WaitlistOfferDeclined:
+      messageId: WaitlistOfferDeclined
+      name: WaitlistOfferDeclined
+      title: Waitlist Offer Declined
+      summary: A Customer has explicitly declined the seat offer.
+      description: |
+        Published when the Customer calls POST /waitlist/offers/{offerId}/decline.
+        The Customer is removed from the waitlist (PRD §7.6: explicit decline
+        removes the member, unlike expiry which may be unintentional). The
+        Waitlist Service then publishes NotifyNextMemberCommand to
+        waitlist.commands to immediately promote the next member rather than
+        waiting for the TTL to expire (PRD §7.6: "Explicit declining frees the
+        seat for the next Customer sooner").
+
+        The Notification Service consumer pushes a brief WebSocket acknowledgement.
+        No email notification required (customer explicitly acted).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistOfferDeclinedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    WaitlistMemberRemoved:
+      messageId: WaitlistMemberRemoved
+      name: WaitlistMemberRemoved
+      title: Waitlist Member Removed
+      summary: A Customer's waitlist entry has been removed (event cancellation or admin action).
+      description: |
+        Published by the Waitlist Service when processing CancelEventWaitlistCommand.
+        One WaitlistMemberRemoved event is published per removed customer.
+        For an event with 200 waitlisted customers, this produces 200 messages
+        on waitlist.events. All messages carry the same eventId partition key,
+        landing on the same partition — the Notification Service processes
+        them in order (serialised, not parallelised within one partition).
+
+        **Fan-out rate:** The Waitlist Service should publish at a controlled
+        rate (batch publish with brief inter-batch pause) to avoid a single
+        partition being overwhelmed. 200 messages at 1ms intervals = 200ms
+        total. Notification Service consumer lag is acceptable here — this is
+        a low-frequency event (event cancellations are rare).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistMemberRemovedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: eventId — partition key
+
+    # --------------------------------------------------------
+    # waitlist.offer-expired messages
+    # --------------------------------------------------------
+
+    WaitlistOfferExpired:
+      messageId: WaitlistOfferExpired
+      name: WaitlistOfferExpired
+      title: Waitlist Offer Expired
+      summary: >
+        A WaitlistOffer TTL has elapsed without the Customer accepting or
+        declining. Triggers next-member promotion.
+      description: |
+        Published by the Waitlist Service on Redis keyspace expiry notification
+        for key `waitlist:offer:{offerId}`. The Waitlist Service consumer
+        (same service) executes the next-member promotion logic (see channel
+        description). The Notification Service does NOT consume this topic —
+        the customer notification for expiry is pushed via waitlist.events
+        (WaitlistOfferDeclined with `reason: EXPIRED`) if the Waitlist Service
+        opts to notify the customer that their offer has lapsed.
+
+        **Partition key: customerId.** Ensures that if both the accept path
+        and the expiry path fire simultaneously (race at TTL boundary), they
+        are processed sequentially within the same consumer thread, and the
+        offer state check in the consumer determines the winner.
+
+        **Why not re-use waitlist.commands for expiry?**
+        waitlist.commands is partitioned by eventId. Offer expiry is a per-customer
+        event (not per-event). Mixing key strategies on one topic forces consumers
+        to deal with non-deterministic partition assignment for the same event
+        across two message types. The separate topic with customerId partitioning
+        provides the ordering guarantee required for the accept-vs-expire race
+        without polluting the eventId-partitioned command stream.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/WaitlistOfferExpiredPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+            description: customerId — partition key
+
+    # --------------------------------------------------------
+    # DLQ message schema
+    # --------------------------------------------------------
+
+    DeadLetteredWaitlistMessage:
+      name: DeadLetteredWaitlistMessage
+      title: Dead-Lettered Waitlist Message
+      summary: >
+        Envelope for a message that exceeded the retry policy and was
+        routed to the DLQ (NFR-REL-007).
+      contentType: application/json
+      headers:
+        type: object
+        required:
+          - x-failure-reason
+          - x-original-topic
+          - x-original-partition
+          - x-original-offset
+          - x-retry-count
+        properties:
+          x-failure-reason:
+            type: string
+            description: Exception class + message from the final failed attempt.
+            example: 'RedisCommandTimeoutException: Command timed out after 5000ms'
+          x-original-topic:
+            type: string
+            example: 'waitlist.commands'
+          x-original-partition:
+            type: integer
+            example: 2
+          x-original-offset:
+            type: integer
+            format: int64
+            example: 1048576
+          x-retry-count:
+            type: integer
+            description: Number of delivery attempts before DLQ routing (max = 3).
+            example: 3
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+        description: The original message payload, preserved verbatim for replay.
+
+  schemas:
+
+    # --------------------------------------------------------
+    # Standard envelope headers (identical across all 12 files)
+    # ADR-003 §3.4.1 message envelope
+    # --------------------------------------------------------
+    StagePassMessageHeaders:
+      type: object
+      required:
+        - x-event-type
+        - x-correlation-id
+        - x-traceparent
+        - x-produced-at
+        - x-schema-version
+      properties:
+        x-event-type:
+          type: string
+          description: >
+            Discriminator for consumer dispatch. Matches the messageId of the
+            message type. Consumers MUST use this header, not payload inspection,
+            for routing (ADR-003 §3.4.1).
+          example: 'NotifyNextMemberCommand'
+        x-correlation-id:
+          type: string
+          format: uuid
+          description: >
+            Business correlation ID generated at the API Gateway for the
+            originating HTTP request. Propagated through all downstream Kafka
+            messages for Loki log correlation (NFR-OBS-001, NFR-OBS-004).
+        x-traceparent:
+          type: string
+          description: >
+            W3C TraceContext traceparent header. Injected by OTel
+            `@opentelemetry/instrumentation-kafkajs` on the NestJS producer.
+            Consumers extract and create child spans (NFR-OBS-003).
+          example: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+        x-tracestate:
+          type: string
+          description: W3C TraceContext tracestate. Optional.
+        x-produced-at:
+          type: string
+          format: date-time
+          description: Producer-side UTC timestamp (ISO-8601). Not the Kafka broker timestamp.
+          example: '2025-01-15T14:30:00.000Z'
+        x-schema-version:
+          type: string
+          description: >
+            Schema version for tolerant reader pattern (ADR-003 §3.4.1).
+            Additive-only evolution: consumers tolerate unknown fields.
+          example: '1.0.0'
+
+    # --------------------------------------------------------
+    # Payload schemas
+    # --------------------------------------------------------
+
+    NotifyNextMemberPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - releasedSeatIds
+        - releasedBy
+        - occurredAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: >
+            Consumer idempotency key (NFR-REL-002). The Waitlist Service
+            deduplicates on messageId using Redis SET NX with a TTL that
+            covers the at-least-once redelivery window.
+        eventId:
+          type: string
+          format: uuid
+          description: Event for which seats have been released. Also the Kafka partition key.
+        releasedSeatIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 8
+          description: >
+            IDs of the seats that have returned to AVAILABLE. Used by the
+            Waitlist Service for preference matching. The top member of the
+            waitlist is offered one of these seats (preference-matched if possible).
+        releasedBy:
+          type: string
+          enum:
+            - BOOKING_CANCELLED   # Customer or Admin cancelled a confirmed booking
+            - PAYMENT_FAILED      # Payment saga failed; booking cancelled; seats released
+            - HOLD_EXPIRED        # Redis TTL expired; no payment initiated
+            - BOOKING_REINSTATED  # Previously cancelled booking reinstated (rare)
+          description: >
+            Source of the seat release. Used for analytics and runbook context.
+            The Waitlist Service does not alter its logic based on this value —
+            offer creation proceeds identically regardless of release reason.
+        occurredAt:
+          type: string
+          format: date-time
+          description: UTC timestamp when the seat transition to AVAILABLE occurred.
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    CancelEventWaitlistPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - cancellationReason
+        - requestedBy
+        - occurredAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        eventId:
+          type: string
+          format: uuid
+          description: Event whose waitlist is to be purged. Also the Kafka partition key.
+        cancellationReason:
+          type: string
+          enum:
+            - EVENT_CANCELLED
+            - VENUE_SUSPENDED
+            - ADMIN_ACTION
+          description: Reason for waitlist purge, forwarded from the event cancellation context.
+        requestedBy:
+          type: string
+          format: uuid
+          description: >
+            ID of the admin, organiser, or venueId that initiated the cancellation.
+            Forwarded from the event.events:event.cancelled payload for audit logging.
+        occurredAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistJoinedPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - customerId
+        - waitlistEntryId
+        - position
+        - seatPreference
+        - joinedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        eventId:
+          type: string
+          format: uuid
+          description: Event the customer joined the waitlist for. Kafka partition key.
+        customerId:
+          type: string
+          format: uuid
+        waitlistEntryId:
+          type: string
+          format: uuid
+          description: >
+            Unique ID for this waitlist entry, usable as a deduplication key
+            if the event is consumed multiple times.
+        position:
+          type: integer
+          minimum: 1
+          description: >
+            Approximate queue position at time of publish. May have changed
+            by the time the Notification Service pushes the WebSocket event
+            (members ahead may have left). Treated as indicative, not authoritative.
+        seatPreference:
+          type: string
+          enum: [STANDARD, PREMIUM, ACCESSIBLE, ANY]
+          description: Customer's stated seat preference. Used for offer matching.
+        joinedAt:
+          type: string
+          format: date-time
+          description: >
+            Redis sorted set score (epoch ms), converted to ISO-8601. Determines
+            FIFO ordering. Lower = earlier join = higher priority.
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistOfferCreatedPayload:
+      type: object
+      required:
+        - messageId
+        - offerId
+        - eventId
+        - customerId
+        - waitlistEntryId
+        - seatId
+        - seatLabel
+        - eventName
+        - eventDateTime
+        - venueName
+        - expiresAt
+        - occurredAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        offerId:
+          type: string
+          format: uuid
+          description: >
+            Unique offer ID. Used by the Customer to call POST /waitlist/offers/{offerId}/accept.
+            Also the Redis key suffix: `waitlist:offer:{offerId}`.
+        eventId:
+          type: string
+          format: uuid
+          description: Kafka partition key.
+        customerId:
+          type: string
+          format: uuid
+          description: Recipient of the offer. Notification Service routes to user:{customerId} room.
+        waitlistEntryId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+          description: >
+            The specific seat being offered. Pre-selected in the booking redirect
+            if the customer accepts. Non-fungible — this exact seat is offered.
+        seatLabel:
+          type: string
+          example: 'Row A, Seat 12'
+          description: Human-readable seat label for Notification Service to include in push/email.
+        eventName:
+          type: string
+          description: Denormalised event name for notification rendering without a REST call.
+        eventDateTime:
+          type: string
+          format: date-time
+          description: Denormalised event datetime for notification rendering.
+        venueName:
+          type: string
+          description: Denormalised venue name for notification rendering.
+        expiresAt:
+          type: string
+          format: date-time
+          description: >
+            Offer expiry timestamp (= occurredAt + 900s). The Notification Service
+            includes this in the WebSocket push for countdown display. The customer
+            must accept before this timestamp or the offer expires.
+        occurredAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistOfferAcceptedPayload:
+      type: object
+      required:
+        - messageId
+        - offerId
+        - eventId
+        - customerId
+        - seatId
+        - acceptedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        offerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+          description: Kafka partition key.
+        customerId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+          description: The seat that was offered and accepted.
+        acceptedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistOfferDeclinedPayload:
+      type: object
+      required:
+        - messageId
+        - offerId
+        - eventId
+        - customerId
+        - seatId
+        - declinedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        offerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+          description: Kafka partition key.
+        customerId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+        declinedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistMemberRemovedPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - customerId
+        - waitlistEntryId
+        - removalReason
+        - occurredAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Consumer idempotency key (NFR-REL-002).
+        eventId:
+          type: string
+          format: uuid
+          description: Kafka partition key.
+        customerId:
+          type: string
+          format: uuid
+        waitlistEntryId:
+          type: string
+          format: uuid
+        removalReason:
+          type: string
+          enum:
+            - EVENT_CANCELLED
+            - VENUE_SUSPENDED
+            - ADMIN_ACTION
+          description: Forwarded from CancelEventWaitlistCommand.cancellationReason.
+        occurredAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          const: '1.0.0'
+
+    WaitlistOfferExpiredPayload:
+      type: object
+      required:
+        - messageId
+        - offerId
+        - eventId
+        - customerId
+        - seatId
+        - expiredAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: >
+            Consumer idempotency key (NFR-REL-002). The Waitlist Service consumer
+            checks `waitlist:offer-processed:{offerId}` (Redis SET NX) before
+            executing promotion logic, using this messageId as the dedup guard.
+        offerId:
+          type: string
+          format: uuid
+          description: >
+            The expired offer. The Waitlist Service consumer verifies this offer
+            is in PENDING state before executing promotion. If the offer was
+            accepted or declined concurrently, the consumer skips promotion.
+        eventId:
+          type: string
+          format: uuid
+          description: >
+            Needed to query the Redis sorted set and promote the next member.
+            NOT the Kafka partition key for this topic (partition key = customerId).
+        customerId:
+          type: string
+          format: uuid
+          description: Kafka partition key. Ensures this expiry and any concurrent accept event land on the same consumer thread.
+        seatId:
+          type: string
+          format: uuid
+          description: The seat that was offered and not claimed. Returns to AVAILABLE for the next offer.
+        expiredAt:
+          type: string
+          format: date-time
+          description: UTC timestamp of Redis keyspace expiry notification detection.
+        schemaVersion:
+          type: string
+          const: '1.0.0'
