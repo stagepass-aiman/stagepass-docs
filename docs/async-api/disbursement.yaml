@@ -1,0 +1,1143 @@
+# ============================================================
+# disbursement.yaml
+#
+# AsyncAPI 2.6 contract — Disbursement Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/disbursement.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Authoritative topic catalogue (all topic params)
+#   ADR-004 §3.3    — Money wire format (string, 4dp)
+#   ADR-005 §3.3    — Step 5b: SCHEDULE_DISBURSEMENT forward + compensation
+#   ADR-005 §3.8    — Revenue split placement at CONFIRMED transition
+#   ADR-008 §3.1    — Split formula, timing, immutability
+#   ADR-008 §3.4    — Escrow, recipient types, payout execution
+#   ADR-008 §3.5    — Disbursement trigger + validation gates
+#   ADR-008 §3.7    — Refund → disbursement ledger interaction
+#   NFR-REL-002     — messageId in every payload (consumer idempotency)
+#   NFR-REL-007     — DLQ per topic
+#   NFR-REL-008     — SERIALIZABLE isolation for money-touching ops
+#   NFR-REL-011     — Cancellation saga idempotency
+#   NFR-REL-012     — Revenue split amounts immutable after CONFIRMED
+#
+# DEFERRED TOPIC NOTE:
+#   `booking.refund-requested` is a booking-domain topic included here
+#   because it was explicitly deferred from booking_async.yaml (Chat 13a)
+#   and is primarily consumed by disbursement-service-consumer alongside
+#   payment-service-consumer. The partition key and all topic parameters
+#   are per ADR-003 §3.4.2 (booking domain table, third row).
+#
+# Topics covered in this file:
+#   booking.refund-requested        (12 partitions, key=bookingId, 7 days)
+#   disbursement.commands           (6 partitions, key=disbursementId, 30 days)
+#   disbursement.events             (6 partitions, key=disbursementId, 90 days)
+#   booking.refund-requested.dlq    (12 partitions, 14-day retention)
+#   disbursement.commands.dlq       (6 partitions, 14-day retention)
+#   disbursement.events.dlq         (6 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:disbursement'
+
+info:
+  title: StagePass — Disbursement Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Disbursement domain** Kafka topics,
+    plus the deferred `booking.refund-requested` topic (see file header).
+
+    **Revenue split immutability (NFR-REL-012, ADR-008 §3.1):**
+    The `revenueSplit` snapshot carried in `booking.refund-requested` is the
+    *source of truth* for all refund and disbursement computations. The
+    Disbursement Service MUST use these stored amounts — it must never
+    re-query current Admin fee configuration, which may have changed since
+    the booking was confirmed.
+
+    **Ledger model (ADR-008 §3.4):**
+    The Disbursement Service maintains an append-only ledger of monetary
+    obligations. `DisbursementSchedule` records are created on
+    `booking.events:booking.confirmed`, then adjusted by refund entries from
+    `booking.refund-requested`. The schedule amount is *never mutated* — only
+    compensating ledger entries are appended. A scheduled job (15-minute
+    cadence) triggers payouts when all three gates pass: (1) no pending
+    refunds, (2) event COMPLETED in event_cache, (3) no Admin hold.
+
+    **Three-party disbursement:** Each confirmed booking produces *two*
+    `DisbursementSchedule` records — one for the Venue, one for the
+    Organiser. The Platform fee is tracked for reconciliation but not
+    disbursed via payout API. Each schedule has its own `disbursementId`
+    and its own Kafka message.
+
+    **Fail-open semantics:** Disbursement failures emit `DisbursementFailed`
+    events and alert on-call, but never block booking operations. Disbursement
+    is fully decoupled from the critical booking saga path.
+
+    **Schema evolution:** Additive only (NFR-REL-002, ADR-003 §3.4.1).
+    Consumers apply the tolerant reader pattern (Kleppmann, DDIA §4).
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+    description: Local Kafka broker (Docker Compose / Minikube)
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    description: MSK production cluster (Phase 9)
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server URL
+
+# ============================================================
+# CHANNELS
+# ============================================================
+
+channels:
+
+  # ----------------------------------------------------------
+  # booking.refund-requested
+  # ADR-003 §3.4.2 (booking domain table), ADR-008 §3.7
+  # DEFERRED from booking_async.yaml (Chat 13a)
+  # 12 partitions, key=bookingId, 7-day retention
+  # ----------------------------------------------------------
+  booking.refund-requested:
+    description: |
+      Published by the **Booking Service** when a booking enters
+      `REFUND_REQUESTED` state. This is the fan-out entry-point for the
+      refund cascade — both the Payment Service and the Disbursement
+      Service must react.
+
+      **Trigger sources:**
+        - Customer self-cancellation (subject to refund policy)
+        - Organiser event cancellation (full refund to all bookings)
+        - Admin booking override
+        - Event cancellation cascade (`event.events:event.cancelled`)
+        - Venue suspension cascade (`venue.events:venue.suspended`)
+
+      **Payment Service consumer action:**
+        Calls Razorpay Refund API for `refundableAmount`. On API success,
+        publishes `payment.events:payment.refund-completed` (ADR-005 §3.4
+        compensation Step 3). Idempotency: deduplicates on `bookingId` —
+        a second message for an already-refunded booking returns success
+        without issuing a second refund (NFR-REL-011).
+
+      **Disbursement Service consumer action:**
+        Appends a `REFUND_PARTIAL` or `REFUND_FULL` entry to the
+        `disbursement_ledger_entry` table for both the Venue and Organiser
+        `DisbursementSchedule` records linked to this `bookingId`. Uses
+        the `refundRatio` and stored `revenueSplit` amounts to compute per-
+        party deduction amounts (ADR-008 §3.7). Does NOT recompute from
+        current rate configuration (NFR-REL-012).
+
+      **Idempotency:** `messageId` is the deduplication key. A consumer
+      that crashes after writing the ledger entry but before committing
+      the Kafka offset will re-receive this message on restart. The DB
+      `UNIQUE` constraint on `(disbursement_schedule_id, entry_type, messageId)`
+      prevents duplicate ledger entries.
+
+      **Cascade volume (ADR-008 §3.7.3):** A Venue with 5 events × 200
+      bookings = 1,000 messages on this topic in a single cascade. Both
+      consumer groups must process at sustained throughput. The payment
+      processor is rate-limited by Razorpay API capacity; see Phase 7
+      load test targets.
+
+      **Partition key: bookingId.**
+      All compensation events for one booking land on the same partition.
+      Consumers observe BOOKING_CONFIRMED → REFUND_REQUESTED in order,
+      preventing a race between disbursement scheduling and refund entry.
+    x-producer: booking-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - payment-service-consumer
+      - disbursement-service-consumer
+    bindings:
+      kafka:
+        topic: booking.refund-requested
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000     # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingRefundRequested
+      summary: Receive a booking refund request
+      message:
+        $ref: '#/components/messages/BookingRefundRequested'
+
+  # ----------------------------------------------------------
+  # disbursement.commands
+  # ADR-003 §3.4.2, ADR-008 §3.5, ADR-005 §3.3 Step 5b compensation
+  # 6 partitions, key=disbursementId, 30-day retention
+  # ----------------------------------------------------------
+  disbursement.commands:
+    description: |
+      Commands consumed exclusively by the **Disbursement Service**.
+      Published by the Booking Service (compensation step) and Admin
+      (manual hold management).
+
+      **CancelDisbursementSchedule** is the compensation for ADR-005
+      Step 5b (SCHEDULE_DISBURSEMENT). It is published by the Booking
+      Service when a confirmed booking must be reversed. The Disbursement
+      Service transitions the matching `DisbursementSchedule` records to
+      `CANCELLED` and appends cancellation ledger entries. Idempotency
+      guarantee: if the schedule is already `CANCELLED`, the consumer
+      returns success and does not create duplicate ledger entries.
+
+      **PlaceDisbursementHold / ReleaseDisbursementHold** are Admin-
+      initiated commands for fraud investigation or dispute resolution.
+      A hold blocks Gate 3 of the disbursement trigger (ADR-008 §3.5.2)
+      for the target booking, event, or recipient until explicitly released
+      or until the hold's `expiresAt` timestamp elapses.
+
+      **Partition key: disbursementId.**
+      Each `DisbursementSchedule` record has its own disbursementId.
+      Using disbursementId as the partition key ensures all commands for
+      one schedule land on the same partition, preventing concurrent
+      cancel and trigger commands from racing. For hold commands without
+      a disbursementId, the `eventId` or `recipientId` is used as the
+      Kafka message key (see message-level key override).
+
+      **6 partitions:** Disbursement commands are low-volume relative to
+      booking events. 6 partitions provide adequate parallelism for the
+      Admin hold use case and compensation sagas.
+    x-producer: booking-service, admin-console
+    x-kafka-partition-key: disbursementId
+    x-consumer-groups:
+      - disbursement-service-consumer
+    bindings:
+      kafka:
+        topic: disbursement.commands
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 2592000000    # 30 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveDisbursementCommand
+      summary: Receive a disbursement command
+      description: |
+        The Disbursement Service consumer discriminates by `commandType`
+        (header `x-event-type`) before dispatching. Unknown command types
+        are logged and dead-lettered — never silently dropped (tolerant
+        reader is for extra *fields*, not for unknown *types*).
+      message:
+        oneOf:
+          - $ref: '#/components/messages/CancelDisbursementSchedule'
+          - $ref: '#/components/messages/PlaceDisbursementHold'
+          - $ref: '#/components/messages/ReleaseDisbursementHold'
+
+  # ----------------------------------------------------------
+  # disbursement.events
+  # ADR-003 §3.4.2, ADR-008 §3.4–3.5
+  # 6 partitions, key=disbursementId, 90-day retention
+  # ----------------------------------------------------------
+  disbursement.events:
+    description: |
+      State-change events published by the **Disbursement Service**.
+      Two independent consumer groups receive every message (Kafka fan-out):
+
+      **analytics-service-consumer:**
+        Records disbursement metrics for Grafana dashboards (GMV disbursed,
+        pending payout volume, failed payout counts). Updates revenue
+        time-series in ClickHouse (ADR-002 Analytics stack).
+
+      **notification-service-consumer:**
+        On `DisbursementCompleted`: pushes payout confirmation to the
+        Organiser or Venue portal WebSocket room and sends a summary email
+        with the payout reference (fire-and-forget per NFR-AVAIL-001).
+        On `DisbursementFailed`: pushes an alert to the Admin dashboard
+        notification stream for manual investigation.
+
+      **Partition key: disbursementId.**
+      Ensures all state transitions for one `DisbursementSchedule` record
+      (PENDING → PROCESSING → COMPLETED) are observed in order by each
+      consumer group. 6 partitions match the command topic — a
+      CancelDisbursementSchedule command and the resulting
+      DisbursementCancelled event land on the same partition.
+
+      **90-day retention:** Disbursement events form part of the financial
+      audit trail. 90 days provides a replay window that covers the
+      statutory minimum for most Indian financial record requirements.
+      Long-term archival is handled by ClickHouse (Analytics Service).
+    x-producer: disbursement-service
+    x-kafka-partition-key: disbursementId
+    x-consumer-groups:
+      - analytics-service-consumer
+      - notification-service-consumer
+    bindings:
+      kafka:
+        topic: disbursement.events
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 7776000000    # 90 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveDisbursementEvent
+      summary: Receive a disbursement state-change event
+      message:
+        oneOf:
+          - $ref: '#/components/messages/DisbursementScheduled'
+          - $ref: '#/components/messages/DisbursementCompleted'
+          - $ref: '#/components/messages/DisbursementFailed'
+          - $ref: '#/components/messages/DisbursementCancelled'
+
+  # ----------------------------------------------------------
+  # booking.refund-requested.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  booking.refund-requested.dlq:
+    description: |
+      Dead-letter queue for `booking.refund-requested` (NFR-REL-007).
+
+      **Failure modes that land here:**
+        - Payment Service Razorpay API is down and all 3 retry attempts
+          with exponential backoff (NFR-REL-006) exhausted.
+        - Disbursement Service PostgreSQL write failed (disk full, deadlock
+          timeout after 3 retries).
+        - Poison pill: message fails JSON deserialisation.
+
+      **Severity:** HIGH. A message dead-lettered here means a refund was
+      NOT issued to a customer or a ledger entry was NOT written. This
+      represents a financial obligation that the platform owes. The
+      KafkaDLQDepthNonZero alert must fire within 5 minutes (NFR-REL-007).
+      Runbook: `/docs/runbooks/kafka-dlq-depth.md` — refund-requested
+      section covers Razorpay API recovery and safe message replay.
+
+      **Replay guidance:** The `bookingId` idempotency guard on both
+      consumers ensures safe replay without double-refunding.
+    x-original-topic: booking.refund-requested
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - refund-requested-dlq-consumer
+    bindings:
+      kafka:
+        topic: booking.refund-requested.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveBookingRefundRequestedDLQ
+      summary: Receive a dead-lettered refund request for investigation and replay
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  # ----------------------------------------------------------
+  # disbursement.commands.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  disbursement.commands.dlq:
+    description: |
+      Dead-letter queue for `disbursement.commands` (NFR-REL-007).
+      A CancelDisbursementSchedule dead-lettered here means the Disbursement
+      Service was unable to cancel a schedule. The schedule may still be in
+      PENDING state and could be incorrectly paid out later. The
+      KafkaDLQDepthNonZero alert fires; the runbook requires manual
+      verification of schedule status before acknowledging.
+    x-original-topic: disbursement.commands
+    x-kafka-partition-key: disbursementId
+    x-consumer-groups:
+      - disbursement-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: disbursement.commands.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveDisbursementCommandDLQ
+      summary: Receive a dead-lettered disbursement command
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  # ----------------------------------------------------------
+  # disbursement.events.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  disbursement.events.dlq:
+    description: |
+      Dead-letter queue for `disbursement.events` (NFR-REL-007).
+      A dead-lettered DisbursementCompleted means Analytics or Notification
+      missed a payout confirmation. Not financially critical (the payout
+      already completed in Razorpay) but requires reprocessing to keep
+      Grafana dashboards and Organiser/Venue portal notifications accurate.
+    x-original-topic: disbursement.events
+    x-kafka-partition-key: disbursementId
+    x-consumer-groups:
+      - disbursement-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: disbursement.events.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000   # 14 days
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveDisbursementEventDLQ
+      summary: Receive a dead-lettered disbursement event
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+# ============================================================
+# COMPONENTS
+# ============================================================
+
+components:
+
+  messages:
+
+    BookingRefundRequested:
+      messageId: BookingRefundRequested
+      name: BookingRefundRequested
+      title: Booking Refund Requested
+      summary: A confirmed booking has been cancelled and a refund must be processed.
+      description: |
+        Carries the full refund context needed by both the Payment Service
+        (to call Razorpay Refund API) and the Disbursement Service (to
+        append ledger entries reducing disbursable amounts).
+
+        **`revenueSplit` is mandatory in this payload.** The Disbursement
+        Service MUST use these stored amounts for proportional refund
+        computation — it must NOT re-query current Admin fee configuration
+        (NFR-REL-012, ADR-008 §3.7). The split amounts were frozen at
+        booking confirmation time and are immutable.
+
+        **`refundableAmount` is the Customer-facing refund amount** (GST-
+        inclusive). Proportional per-party deductions are computed by the
+        Disbursement Service using `refundRatio` against stored split amounts.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/BookingRefundRequestedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    CancelDisbursementSchedule:
+      messageId: CancelDisbursementSchedule
+      name: CancelDisbursementSchedule
+      title: Cancel Disbursement Schedule
+      summary: |
+        Compensation command — cancel DisbursementSchedule records for a
+        booking. ADR-005 §3.3 Step 5b compensation.
+      description: |
+        Published by the Booking Service when a CONFIRMED booking must be
+        reversed (e.g., post-confirmation fraud detection flagging CRITICAL
+        risk, or full refund saga). Instructs the Disbursement Service to
+        transition both `DisbursementSchedule` records (Venue + Organiser)
+        for this `bookingId` to `CANCELLED` state.
+
+        **Idempotency (NFR-REL-011):** The Disbursement Service checks
+        current schedule status before writing. If already `CANCELLED`,
+        it returns success without creating duplicate ledger entries.
+        The `messageId` is the deduplication key in the DLQ replay scenario.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/CancelDisbursementSchedulePayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PlaceDisbursementHold:
+      messageId: PlaceDisbursementHold
+      name: PlaceDisbursementHold
+      title: Place Disbursement Hold
+      summary: Admin-initiated hold blocking payout for a booking, event, or recipient.
+      description: |
+        Published by Admin Console when a disbursement must be paused for
+        investigation (fraud, dispute, regulatory). Blocks Gate 3 of the
+        disbursement trigger (ADR-008 §3.5.2) until the hold expires or
+        is explicitly released via `ReleaseDisbursementHold`.
+
+        **Target scope:** Holds can be scoped to:
+          - `BOOKING` — single booking's disbursement records
+          - `EVENT` — all disbursement records for an event
+          - `RECIPIENT` — all records payable to a specific Organiser/Venue
+
+        **Expiry:** `expiresAt` is optional. A null expiry means the hold
+        is indefinite until explicitly released. The 15-minute scheduled
+        job re-evaluates Gate 3 on every run, so hold expiry is effective
+        within 15 minutes of the expiry timestamp.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PlaceDisbursementHoldPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    ReleaseDisbursementHold:
+      messageId: ReleaseDisbursementHold
+      name: ReleaseDisbursementHold
+      title: Release Disbursement Hold
+      summary: Admin-initiated release of a previously placed disbursement hold.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/ReleaseDisbursementHoldPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DisbursementScheduled:
+      messageId: DisbursementScheduled
+      name: DisbursementScheduled
+      title: Disbursement Scheduled
+      summary: A DisbursementSchedule record has been created for a confirmed booking.
+      description: |
+        Published by the Disbursement Service after consuming a
+        `booking.events:booking.confirmed` event and creating
+        `DisbursementSchedule` records for Venue and Organiser.
+        One `DisbursementScheduled` event is emitted per schedule record
+        (i.e., two events per confirmed booking — one per recipient).
+
+        Analytics uses this to track accrued disbursable volume in real time
+        (NFR-OBS-005: GMV/min, pending payout volume).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/DisbursementScheduledPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DisbursementCompleted:
+      messageId: DisbursementCompleted
+      name: DisbursementCompleted
+      title: Disbursement Completed
+      summary: A payout has been successfully transferred to the Venue or Organiser.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/DisbursementCompletedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DisbursementFailed:
+      messageId: DisbursementFailed
+      name: DisbursementFailed
+      title: Disbursement Failed
+      summary: A payout attempt failed after exhausting retries. Admin intervention required.
+      description: |
+        The scheduled job retries failed payouts up to 3 times with
+        exponential backoff (NFR-REL-006). After 3 consecutive failures,
+        `DisbursementFailed` is published and the `DisbursementSchedule`
+        enters `FAILED` state. A Prometheus alert fires for Admin review.
+        Admin can either retry via the REST endpoint or place a hold and
+        investigate the Razorpay payout API failure reason.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/DisbursementFailedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DisbursementCancelled:
+      messageId: DisbursementCancelled
+      name: DisbursementCancelled
+      title: Disbursement Cancelled
+      summary: A DisbursementSchedule has been cancelled. No payout will occur.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/DisbursementCancelledPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      summary: Original message that failed processing after maximum retry attempts.
+      contentType: application/json
+      headers:
+        type: object
+        required:
+          - x-failure-reason
+          - x-original-topic
+          - x-original-partition
+          - x-original-offset
+          - x-retry-count
+        properties:
+          x-failure-reason:
+            type: string
+            description: |
+              Exception class and message from the final failed processing attempt.
+              Format: '<ExceptionClass>: <message>'. Used for triage.
+            example: 'TransientDataAccessException: could not execute statement'
+          x-original-topic:
+            type: string
+            description: The source topic from which this message was dead-lettered.
+          x-original-partition:
+            type: integer
+            description: Source partition number (for offset-based replay).
+          x-original-offset:
+            type: integer
+            format: int64
+            description: Source offset (for offset-based replay).
+          x-retry-count:
+            type: integer
+            description: Number of delivery attempts before dead-lettering (always 3).
+          x-event-type:
+            type: string
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-tracestate:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+          x-schema-version:
+            type: string
+      payload:
+        description: The original message payload, preserved verbatim.
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    # ---- Standard Kafka message headers (ADR-003 §3.4.1) --------
+    StagePassMessageHeaders:
+      type: object
+      required:
+        - x-event-type
+        - x-correlation-id
+        - x-traceparent
+        - x-produced-at
+        - x-schema-version
+      properties:
+        x-event-type:
+          type: string
+          description: Message type discriminator. Matches messageId of the payload.
+          example: BookingRefundRequested
+        x-correlation-id:
+          type: string
+          format: uuid
+          description: |
+            Propagated from the originating HTTP request X-Correlation-Id header.
+            Unchanged across all Kafka hops in a saga. Used to correlate all log
+            events and spans for a single user-initiated action (NFR-OBS-004).
+        x-traceparent:
+          type: string
+          description: |
+            W3C traceparent header (OTel). Injected by producer; extracted by
+            consumer to create child spans. Enables unbroken distributed traces
+            across Kafka hops in Jaeger (NFR-OBS-003).
+          example: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+        x-tracestate:
+          type: string
+          description: W3C tracestate (OTel). May be empty string if no vendor state.
+        x-produced-at:
+          type: string
+          format: date-time
+          description: Producer timestamp (UTC, ISO-8601). Monotonic clock from producer.
+          example: '2025-01-15T14:30:00.000Z'
+        x-schema-version:
+          type: string
+          description: Semantic version of the message schema. Consumers tolerate unknown fields.
+          example: '1.0.0'
+
+    # ---- Shared money type (ADR-004 §3.3) -----------------------
+    MoneyAmount:
+      type: object
+      description: |
+        Exact monetary amount. `amount` is ALWAYS a JSON string — NEVER a
+        JSON number (ADR-004 §3.3). Receivers parse into:
+          Java → BigDecimal, TypeScript → decimal.js Decimal, Python → decimal.Decimal
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: Exact 4dp decimal string. Trailing zeros preserved ("75.0000").
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO-4217 code. v1.0 uses INR exclusively.
+          example: 'INR'
+
+    # ---- Revenue split snapshot (ADR-004 §3.3, NFR-REL-012) -----
+    # Cross-reference: identical definition in booking_async.yaml.
+    # Redefined here for standalone file validity.
+    RevenueSplit:
+      type: object
+      description: |
+        Immutable revenue split computed once at booking CONFIRMED transition
+        (ADR-005 §3.8). Consumers MUST use these stored amounts — never
+        recompute from current Admin configuration (NFR-REL-012).
+        organiserShareAmount = basePrice − platformFeeAmount − venueShareAmount
+        (remainder absorbs rounding residual, ADR-004 §3.6).
+      required:
+        - salePrice
+        - basePrice
+        - gstAmount
+        - platformFeeRate
+        - platformFeeAmount
+        - venueShareRate
+        - venueShareAmount
+        - organiserShareAmount
+        - currency
+        - computedAt
+      properties:
+        salePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: GST-inclusive price paid by the Customer.
+        basePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: GST-exclusive price — input to split arithmetic.
+        gstAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: gstAmount = salePrice − basePrice. Remitted separately.
+        platformFeeRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: Platform fee rate as decimal fraction ("0.0500" = 5%).
+          example: '0.0500'
+        platformFeeAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        venueShareRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: Venue share rate as decimal fraction. Locked in VenueBooking at ACCEPTED.
+          example: '0.2000'
+        venueShareAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        organiserShareAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Remainder. organiserShare = basePrice − platformFee − venueShare.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: 'INR'
+        computedAt:
+          type: string
+          format: date-time
+          description: Timestamp when this split was computed (CONFIRMED transition).
+
+    # ---- Payload schemas ----------------------------------------
+
+    BookingRefundRequestedPayload:
+      type: object
+      required:
+        - messageId
+        - bookingId
+        - paymentOrderId
+        - customerId
+        - eventId
+        - refundType
+        - refundPolicy
+        - refundableAmount
+        - originalSalePrice
+        - refundRatio
+        - revenueSplit
+        - cancellationSource
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: |
+            Unique per message (NFR-REL-002). Consumer deduplication key.
+            Consumers SET NX this ID with TTL to detect redeliveries.
+        bookingId:
+          type: string
+          format: uuid
+        paymentOrderId:
+          type: string
+          format: uuid
+          description: Correlates with payment.events for Payment Service tracing.
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        refundType:
+          type: string
+          enum: [FULL, PARTIAL]
+          description: |
+            FULL — entire salePrice refunded; disbursable amounts → zero.
+            PARTIAL — proportional refund per refund policy.
+        refundPolicy:
+          type: string
+          enum: [PRE_CUTOFF_FULL, SEVEN_DAY_FIFTY_PERCENT, WITHIN_24H_ZERO, EVENT_CANCELLED_FULL, ADMIN_OVERRIDE]
+          description: |
+            The refund policy that determined the refundable percentage.
+            EVENT_CANCELLED_FULL and ADMIN_OVERRIDE always produce FULL refund type.
+        refundableAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: GST-inclusive amount to be returned to the Customer.
+        originalSalePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: GST-inclusive sale price at time of booking confirmation.
+        refundRatio:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: |
+            refundableAmount / originalSalePrice, 4dp HALF_UP. Used by the
+            Disbursement Service to compute per-party deduction:
+              refundPartyShare = storedPartyAmount × refundRatio
+            "1.0000" for full refund; "0.5000" for 50% partial (ADR-008 §3.7).
+          example: '1.0000'
+        revenueSplit:
+          $ref: '#/components/schemas/RevenueSplit'
+          description: |
+            CRITICAL: The immutable split snapshot from booking confirmation.
+            Disbursement Service uses these stored amounts for per-party refund
+            computation. NEVER re-queries Admin configuration (NFR-REL-012).
+        cancellationSource:
+          type: string
+          enum: [CUSTOMER, ORGANISER, ADMIN, EVENT_CANCELLED, VENUE_SUSPENDED]
+          description: Actor that initiated cancellation (audit field).
+        requestedAt:
+          type: string
+          format: date-time
+          description: Timestamp when Booking Service transitioned to REFUND_REQUESTED.
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    CancelDisbursementSchedulePayload:
+      type: object
+      required:
+        - messageId
+        - bookingId
+        - reason
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Deduplication key (NFR-REL-002).
+        bookingId:
+          type: string
+          format: uuid
+          description: |
+            Targets ALL DisbursementSchedule records for this bookingId
+            (both Venue and Organiser records). The Disbursement Service
+            resolves the set of disbursementIds from this bookingId.
+        disbursementIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Optional. If provided, cancels only the listed schedules.
+            If absent, cancels all schedules for the bookingId.
+        reason:
+          type: string
+          enum: [BOOKING_CANCELLED, EVENT_CANCELLED, VENUE_SUSPENDED, FRAUD_DETECTED, ADMIN_OVERRIDE]
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    PlaceDisbursementHoldPayload:
+      type: object
+      required:
+        - messageId
+        - holdId
+        - targetType
+        - targetId
+        - reason
+        - placedByAdminId
+        - placedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        holdId:
+          type: string
+          format: uuid
+          description: Stable ID for this hold. Referenced by ReleaseDisbursementHold.
+        targetType:
+          type: string
+          enum: [BOOKING, EVENT, RECIPIENT]
+        targetId:
+          type: string
+          format: uuid
+          description: bookingId, eventId, or recipientId depending on targetType.
+        reason:
+          type: string
+          maxLength: 500
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Null = hold is indefinite until explicitly released.
+        placedByAdminId:
+          type: string
+          format: uuid
+        placedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    ReleaseDisbursementHoldPayload:
+      type: object
+      required:
+        - messageId
+        - holdId
+        - reason
+        - releasedByAdminId
+        - releasedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        holdId:
+          type: string
+          format: uuid
+          description: References PlaceDisbursementHold.holdId.
+        reason:
+          type: string
+          maxLength: 500
+        releasedByAdminId:
+          type: string
+          format: uuid
+        releasedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    DisbursementScheduledPayload:
+      type: object
+      required:
+        - messageId
+        - disbursementId
+        - bookingId
+        - eventId
+        - recipientId
+        - recipientType
+        - scheduledAmount
+        - triggerAfter
+        - scheduledAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        disbursementId:
+          type: string
+          format: uuid
+          description: |
+            Primary key of the DisbursementSchedule record. Unique per recipient
+            per booking. Two DisbursementScheduled events per confirmed booking.
+        bookingId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        recipientId:
+          type: string
+          format: uuid
+          description: venueId or organiserId.
+        recipientType:
+          type: string
+          enum: [VENUE, ORGANISER]
+        scheduledAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: |
+            Initial disbursable amount from revenueSplit (venueShareAmount or
+            organiserShareAmount). May be reduced by subsequent refund ledger
+            entries. This field represents the ORIGINAL scheduled amount, not
+            the current disbursable amount (which accounts for refunds).
+        triggerAfter:
+          type: string
+          format: date-time
+          description: |
+            event.endDateTime + Admin.disbursementWindowHours (default 48h).
+            The scheduled job evaluates schedules where triggerAfter ≤ NOW()
+            (ADR-008 §3.5.1).
+        scheduledAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    DisbursementCompletedPayload:
+      type: object
+      required:
+        - messageId
+        - disbursementId
+        - bookingId
+        - eventId
+        - recipientId
+        - recipientType
+        - disbursedAmount
+        - completedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        disbursementId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        recipientId:
+          type: string
+          format: uuid
+        recipientType:
+          type: string
+          enum: [VENUE, ORGANISER]
+        disbursedAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: |
+            Actual amount transferred: originalAmount − SUM(refundDeductions).
+            May be "0.0000" if all funds were refunded (zero-disbursement
+            completion path — ADR-008 §3.5.3).
+        payoutReference:
+          type: string
+          nullable: true
+          description: |
+            Razorpay payout reference ID. Null if disbursedAmount = "0.0000"
+            (no payout API call was made).
+        completedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    DisbursementFailedPayload:
+      type: object
+      required:
+        - messageId
+        - disbursementId
+        - bookingId
+        - recipientId
+        - recipientType
+        - attemptCount
+        - lastFailureReason
+        - failedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        disbursementId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        recipientId:
+          type: string
+          format: uuid
+        recipientType:
+          type: string
+          enum: [VENUE, ORGANISER]
+        attemptCount:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: Number of payout attempts made before entering FAILED state.
+        lastFailureReason:
+          type: string
+          description: Exception message from the final Razorpay API call failure.
+        failedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    DisbursementCancelledPayload:
+      type: object
+      required:
+        - messageId
+        - disbursementId
+        - bookingId
+        - recipientId
+        - recipientType
+        - reason
+        - cancelledAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        disbursementId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        recipientId:
+          type: string
+          format: uuid
+        recipientType:
+          type: string
+          enum: [VENUE, ORGANISER]
+        reason:
+          type: string
+          enum: [BOOKING_CANCELLED, EVENT_CANCELLED, VENUE_SUSPENDED, FRAUD_DETECTED, FULL_REFUND_APPLIED, ADMIN_OVERRIDE]
+        cancelledAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
