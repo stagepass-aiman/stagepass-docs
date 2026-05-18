@@ -1,0 +1,553 @@
+# ============================================================
+# fraud.yaml
+#
+# AsyncAPI 2.6 contract — Fraud Detection Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/fraud.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (fraud domain table)
+#   ADR-005 §3.3    — Step 5d: PUBLISH_FRAUD_REQUEST (fire-and-forget)
+#   NFR-PERF-011    — Fraud score published within 10s of booking.created
+#   NFR-AVAIL-005   — Fraud failure never blocks booking (fail-open)
+#   NFR-REL-002     — messageId in every payload
+#   NFR-REL-007     — DLQ per topic
+#
+# FRAUD DETECTION ARCHITECTURE:
+#   Fraud scoring is entirely asynchronous and fire-and-forget relative to
+#   the booking saga. The saga NEVER awaits a fraud score result. A booking
+#   proceeds to CONFIRMED regardless of fraud score (NFR-AVAIL-005).
+#
+#   The fraud score result informs:
+#     1. Booking Service: annotates the booking record with risk level for
+#        retrospective review. CRITICAL risk may trigger Admin review queue
+#        entry (not automatic cancellation).
+#     2. admin-notification-consumer: pushes HIGH/CRITICAL risk bookings
+#        to the Admin fraud review dashboard in real time.
+#
+#   **10-second SLA (NFR-PERF-011):**
+#   The Booking Service publishes to fraud.score-requests immediately after
+#   writing the PENDING booking record (ADR-005 Step 5d, parallel to saga
+#   Step 1). The Fraud Detection Service (FastAPI / Python) must consume and
+#   publish the score within 10 seconds. This is a service-level SLA, not a
+#   consumer-blocking requirement. Prometheus alert: FraudScoreLatencyHigh.
+#
+#   **Model serving:** In Phase 5, the Fraud Detection Service runs ML
+#   inference (gradient boosting, Phase 5 design). In Phase 4 stub, it
+#   returns a rule-based score (velocity check: > 5 bookings/hour = MEDIUM).
+#   The schema is identical in both phases.
+#
+# Topics covered:
+#   fraud.score-requests      (12 partitions, key=bookingId, 3 days)
+#   fraud.score-results       (12 partitions, key=bookingId, 7 days)
+#   fraud.score-requests.dlq  (12 partitions, 14-day retention)
+#   fraud.score-results.dlq   (12 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:fraud'
+
+info:
+  title: StagePass — Fraud Detection Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Fraud Detection domain** Kafka topics.
+
+    **Fail-open guarantee (NFR-AVAIL-005):** The Fraud Detection Service is
+    a T3 Enhancement service (99.0% SLO). If it is down or returns an error,
+    the booking proceeds as LOW-risk. This is a deliberate business decision:
+    blocking legitimate purchases due to fraud service unavailability causes
+    more revenue harm than the occasional undetected fraud event. The fail-
+    open behaviour is enforced at the Booking Service level — it never awaits
+    a fraud result before advancing the saga.
+
+    **Privacy considerations:** The `FraudScoreRequest` payload contains
+    velocity data and a masked IP address (last octet zeroed). No PII beyond
+    what is already stored in the Booking record is included. The fraud topic
+    is not replayed to external systems. Retention is 3 days for requests
+    (score computed within 10s) and 7 days for results (needed for booking
+    annotation reconciliation on consumer restart).
+
+    **Schema evolution:** Additive only. The `signals[]` array in
+    `FraudScoreResult` is open-ended to allow new detection signals without
+    a schema version bump. Consumers must tolerate unknown signal strings.
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server
+
+channels:
+
+  # ----------------------------------------------------------
+  # fraud.score-requests
+  # 12 partitions, key=bookingId, 3-day retention
+  # ----------------------------------------------------------
+  fraud.score-requests:
+    description: |
+      Published by the **Booking Service** immediately after writing the
+      PENDING booking record to PostgreSQL (ADR-005 Step 5d). This is a
+      fire-and-forget publish — the Booking Service does not await any
+      response before proceeding with the saga.
+
+      **Fraud Detection Service consumer action:**
+        1. Extract features from `FraudScoreRequest` (velocity context,
+           amount, seat count, device fingerprint).
+        2. In Phase 4 stub: apply rule-based scoring (velocity thresholds).
+           In Phase 5: run ML inference on the trained gradient boosting model.
+        3. Publish `FraudScoreResult` to `fraud.score-results` within 10s
+           (NFR-PERF-011). This is the end-to-end SLA including consumer lag.
+        4. If inference fails: publish LOW risk score (fail-open). The model
+           failure is logged as an error but must not propagate to the Booking
+           saga.
+
+      **Partition key: bookingId.**
+      Ensures request and result for the same booking land on the same
+      partition in both topics. This simplifies Booking Service correlation
+      when consuming score results: it knows the result for its own bookings
+      arrives on the partition determined by bookingId hash. 12 partitions
+      match fraud.score-results for symmetric partition assignment.
+
+      **3-day retention:** Fraud requests are transient. The score is
+      computed within seconds (NFR-PERF-011: 10s SLA). 3 days provides
+      DLQ replay headroom for Fraud Detection Service outages. Requests
+      older than 3 days are scored as LOW-risk during replay (time-sensitive
+      signals like velocity are stale).
+    x-producer: booking-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - fraud-detection-service-consumer
+    bindings:
+      kafka:
+        topic: fraud.score-requests
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 259200000    # 3 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFraudScoreRequest
+      summary: Receive a fraud scoring request for a newly created booking
+      message:
+        $ref: '#/components/messages/FraudScoreRequest'
+
+  # ----------------------------------------------------------
+  # fraud.score-results
+  # 12 partitions, key=bookingId, 7-day retention
+  # ----------------------------------------------------------
+  fraud.score-results:
+    description: |
+      Published by the **Fraud Detection Service** (FastAPI / Python) after
+      computing a fraud score for a booking. Two independent consumer groups:
+
+      **booking-service-consumer:**
+        Annotates the Booking PostgreSQL record with `riskLevel` and
+        `fraudScoreRequestId` (for correlation). Does NOT change booking state
+        — annotation is retrospective. A CRITICAL risk score may trigger Admin
+        review queue insertion but never auto-cancels the booking (fail-open
+        principle, NFR-AVAIL-005). Deduplicates on `messageId` — if the
+        Booking record is already annotated, the consumer returns success.
+
+      **admin-notification-consumer:**
+        On riskLevel = HIGH or CRITICAL: publishes a notification command to
+        `notification.commands` targeting the Admin dashboard WebSocket room,
+        or directly pushes to the Admin Socket.IO room. Provides real-time
+        fraud review queue population for Admin.
+        On riskLevel = LOW or MEDIUM: no action (no noise for routine bookings).
+
+      **10-second SLA (NFR-PERF-011):**
+        The Prometheus metric `fraud_score_result_latency_seconds` tracks
+        elapsed time from `FraudScoreRequest.requestedAt` to
+        `FraudScoreResult.scoredAt`. Alert: FraudScoreLatencyHigh fires when
+        p95 > 10s. Runbook: /docs/runbooks/fraud-score-latency.md.
+
+      **Partition key: bookingId** (same as fraud.score-requests).
+      Ensures request and result for the same booking are co-partitioned.
+      The Booking Service consumer processes results for its own bookings
+      in the same partition as its own booking.events — simplifying local
+      state management within a consumer instance.
+
+      **7-day retention:** Results must be replayable to re-annotate Booking
+      records after a Booking Service incident. 7 days exceeds the expected
+      manual recovery window.
+    x-producer: fraud-detection-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - booking-service-consumer
+      - admin-notification-consumer
+    bindings:
+      kafka:
+        topic: fraud.score-results
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000    # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFraudScoreResult
+      summary: Receive a fraud score result for booking annotation
+      message:
+        $ref: '#/components/messages/FraudScoreResult'
+
+  # ----------------------------------------------------------
+  # DLQs — NFR-REL-007
+  # ----------------------------------------------------------
+  fraud.score-requests.dlq:
+    description: |
+      Dead-letter queue for `fraud.score-requests` (NFR-REL-007).
+      A dead-lettered request means no fraud score was computed for a booking.
+      The booking already proceeded as LOW-risk (fail-open). Replay after
+      Fraud Detection Service recovery is useful for retrospective scoring
+      of bookings made during the outage window. Scores computed > 3 days
+      after the request timestamp should be treated as LOW-risk by the
+      consumer (velocity signals are stale).
+    x-original-topic: fraud.score-requests
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - fraud-score-requests-dlq-consumer
+    bindings:
+      kafka:
+        topic: fraud.score-requests.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFraudScoreRequestDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  fraud.score-results.dlq:
+    description: |
+      Dead-letter queue for `fraud.score-results` (NFR-REL-007).
+      A dead-lettered result means the Booking record was not annotated.
+      Non-critical (booking is live and confirmed). Replay after Booking
+      Service recovery will retrospectively annotate the record. Admin
+      notification consumer failure means CRITICAL risk bookings were not
+      surfaced to the fraud review queue — replay is important for HIGH/CRITICAL
+      results.
+    x-original-topic: fraud.score-results
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - fraud-score-results-dlq-consumer
+    bindings:
+      kafka:
+        topic: fraud.score-results.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveFraudScoreResultDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+components:
+
+  messages:
+
+    FraudScoreRequest:
+      messageId: FraudScoreRequest
+      name: FraudScoreRequest
+      title: Fraud Score Request
+      summary: Request for async ML fraud scoring of a newly created booking.
+      description: |
+        Contains all features available at booking creation time. In Phase 4
+        (stub), only `velocityContext` is used for rule-based scoring.
+        In Phase 5 (ML), all fields feed the gradient boosting model.
+        The schema is backward-compatible between phases.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/FraudScoreRequestPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    FraudScoreResult:
+      messageId: FraudScoreResult
+      name: FraudScoreResult
+      title: Fraud Score Result
+      summary: Async fraud score for a booking. Never blocks the booking saga.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/FraudScoreResultPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      contentType: application/json
+      headers:
+        type: object
+        required: [x-failure-reason, x-original-topic, x-original-partition, x-original-offset, x-retry-count]
+        properties:
+          x-failure-reason:
+            type: string
+          x-original-topic:
+            type: string
+          x-original-partition:
+            type: integer
+          x-original-offset:
+            type: integer
+            format: int64
+          x-retry-count:
+            type: integer
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+          example: FraudScoreRequest
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          example: '1.0.0'
+
+    MoneyAmount:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: 'INR'
+
+    FraudScoreRequestPayload:
+      type: object
+      required:
+        - messageId
+        - bookingId
+        - customerId
+        - eventId
+        - seatCount
+        - totalAmount
+        - velocityContext
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: |
+            Also used as the fraud score request correlation ID.
+            Referenced in FraudScoreResult.scoreRequestId for tracing.
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatCount:
+          type: integer
+          minimum: 1
+          maximum: 8
+          description: Number of seats in this booking. High seat count is a scalping signal.
+        totalAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: |
+            Total GST-inclusive amount for this booking.
+            High-value bookings receive elevated scrutiny weight in the model.
+        ipAddressMasked:
+          type: string
+          description: |
+            Customer IP address with last octet zeroed ("192.168.1.0").
+            Used for geolocation anomaly detection. Masking preserves
+            privacy while retaining location signal. PII-safe.
+          example: '203.0.113.0'
+        userAgent:
+          type: string
+          maxLength: 512
+          description: Browser/app user agent. Used for bot detection pattern matching.
+        deviceFingerprint:
+          type: string
+          nullable: true
+          description: |
+            Opaque device fingerprint hash from the frontend (Phase 5 feature).
+            Null in Phase 4. Enables device-based velocity and consistency checks.
+        velocityContext:
+          type: object
+          required:
+            - bookingsLast1h
+            - bookingsLast24h
+            - uniqueEventsLast24h
+            - paymentMethodsUsedLast7d
+          description: |
+            Pre-computed velocity features from the Booking Service
+            (queried from Redis counters at request time, not from DB —
+            sub-millisecond reads). The Fraud Detection Service does not
+            need to query any database to access these features.
+          properties:
+            bookingsLast1h:
+              type: integer
+              minimum: 0
+              description: Total confirmed + pending bookings by this customerId in last 60 minutes.
+            bookingsLast24h:
+              type: integer
+              minimum: 0
+            uniqueEventsLast24h:
+              type: integer
+              minimum: 0
+              description: Distinct events booked in last 24h. High count = scalping signal.
+            paymentMethodsUsedLast7d:
+              type: integer
+              minimum: 0
+              description: Distinct payment methods used. > 3 is anomalous.
+            seatsLast1h:
+              type: integer
+              minimum: 0
+              description: Total seat count across all bookings in last 60 minutes.
+        requestedAt:
+          type: string
+          format: date-time
+          description: |
+            Timestamp of booking creation. The Fraud Detection Service uses
+            this to compute elapsed time and gauge signal freshness.
+            Results published > 10s after this timestamp miss the SLA
+            (NFR-PERF-011).
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    FraudScoreResultPayload:
+      type: object
+      required:
+        - messageId
+        - scoreRequestId
+        - bookingId
+        - customerId
+        - riskScore
+        - riskLevel
+        - recommendedAction
+        - scoredAt
+        - modelVersion
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        scoreRequestId:
+          type: string
+          format: uuid
+          description: References FraudScoreRequest.messageId. Used for tracing and correlation.
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        riskScore:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: |
+            Continuous risk probability (0.0 = no risk, 1.0 = certain fraud).
+            NOTE: This is the only field in the platform schema where `number`
+            (float) is acceptable. Fraud risk scores are probabilistic estimates,
+            not monetary values. They are not stored in financial ledgers and are
+            not subject to ADR-004 exact decimal constraints.
+          example: 0.73
+        riskLevel:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+          description: |
+            Discretised risk band derived from riskScore thresholds:
+              LOW:      riskScore < 0.30
+              MEDIUM:   0.30 ≤ riskScore < 0.60
+              HIGH:     0.60 ≤ riskScore < 0.85
+              CRITICAL: riskScore ≥ 0.85
+            Thresholds are model-configuration values, not schema constants —
+            the Phase 5 ML model may adjust thresholds. The enum values here
+            are stable.
+        signals:
+          type: array
+          items:
+            type: string
+          description: |
+            Human-readable signals that contributed to the score.
+            Consumers must tolerate unknown signal strings (additive evolution).
+          example: ['velocity_anomaly_1h', 'high_seat_count', 'new_payment_method']
+        recommendedAction:
+          type: string
+          enum: [ALLOW, REVIEW, BLOCK]
+          description: |
+            ALLOW  — proceed normally (LOW, MEDIUM with no anomalies)
+            REVIEW — flag for Admin manual review (HIGH)
+            BLOCK  — flag for immediate Admin action (CRITICAL)
+            NOTE: The Booking Service NEVER auto-blocks based on this field
+            (NFR-AVAIL-005). BLOCK is a signal to Admin, not an automated action.
+        scoredAt:
+          type: string
+          format: date-time
+          description: Timestamp when score was computed. Used for NFR-PERF-011 SLA measurement.
+        modelVersion:
+          type: string
+          description: |
+            Identifies the scoring model (Phase 4 stub = "rule-based-v1",
+            Phase 5 ML = "gbm-v{major}.{minor}"). Enables retrospective
+            analysis of model drift after model updates.
+          example: 'rule-based-v1'
+        schemaVersion:
+          type: string
+          example: '1.0.0'

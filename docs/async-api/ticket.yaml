@@ -1,0 +1,809 @@
+# ticket.yaml — AsyncAPI 2.6 — Phase 1 Design — stagepass-docs /docs/async-api/ticket.yaml
+# ============================================================
+# ticket.yaml
+#
+# AsyncAPI 2.6 contract — Ticket Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/ticket.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (ticket domain table)
+#   ADR-005 §3.3    — Step 5a: ISSUE_TICKETS forward + VOID_TICKETS compensation
+#   NFR-PERF-004    — QR check-in verification p99 < 200ms (signature-only)
+#   NFR-REL-002     — messageId in every payload
+#   NFR-REL-007     — DLQ per topic
+#   NFR-SEC-005     — QR tokens HMAC-SHA256 signed; per-event secret
+#   NFR-SEC-006     — Check-in endpoint idempotent; duplicate scan returns success
+#
+# QR TOKEN MODEL (NFR-SEC-005):
+#   Each ticket carries a signed token. The signing key is per-event
+#   (Admin-configurable). The signed payload encodes:
+#     ticketId + eventId + seatId + customerId + issuedAt
+#   Verification at check-in is signature-only — no network call required
+#   (NFR-PERF-004: p99 < 200ms). The Check-in Service caches event signing
+#   keys on startup and refreshes via REST on cache miss (NFR-AVAIL-006).
+#
+# Topics covered:
+#   ticket.commands          (12 partitions, key=bookingId, 3 days)
+#   ticket.events            (12 partitions, key=ticketId, 30 days)
+#   ticket.checked-in        (12 partitions, key=ticketId, 90 days)
+#   ticket.commands.dlq      (12 partitions, 14-day retention)
+#   ticket.events.dlq        (12 partitions, 14-day retention)
+#   ticket.checked-in.dlq   (12 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:ticket'
+
+info:
+  title: StagePass — Ticket Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Ticket domain** Kafka topics.
+
+    **Publisher of ticket.commands:** Booking Service (Kafka via Outbox).
+    Step 5a of the booking saga: `booking.events:booking.confirmed` is consumed
+    by the Ticket Service to issue tickets. `VoidTickets` is the compensation
+    command for Step 5a, published when a CONFIRMED booking is reversed.
+
+    **Publisher of ticket.events:** Ticket Service (Fastify / Node.js).
+    Published via Outbox after each ticket is written to PostgreSQL with
+    its HMAC-SHA256 signed QR token (NFR-SEC-005). One `TicketIssued` event
+    per seat in the booking (a 4-seat booking emits 4 TicketIssued events,
+    all with the same `bookingId` but distinct `ticketId` and `seatId`).
+
+    **Publisher of ticket.checked-in:** Check-in Service (Fastify / Node.js).
+    Emitted after offline signature verification (NFR-PERF-004). Contains
+    the verification method — SIGNATURE_ONLY confirms no network call was
+    made at scan time (the happy path).
+
+    **QR token in TicketIssued:** Consumers downstream (Notification Service,
+    Check-in Service) receive the signed token via this event. The Notification
+    Service includes the token in the confirmation email/PDF. The Check-in
+    Service caches token metadata for fast offline validation.
+
+    **Schema evolution:** Additive only (NFR-REL-002). Consumers tolerate
+    unknown fields (Kleppmann DDIA §4).
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+    description: Local Kafka broker
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server
+
+channels:
+
+  # ----------------------------------------------------------
+  # ticket.commands
+  # 12 partitions, key=bookingId, 3-day retention
+  # ----------------------------------------------------------
+  ticket.commands:
+    description: |
+      Commands for the **Ticket Service** published by the Booking Service.
+
+      **IssueTickets** is the Step 5a forward action (ADR-005 §3.3).
+      The Booking Service publishes this command when consuming
+      `booking.events:booking.confirmed`. The Ticket Service generates
+      one ticket record per seat, computing an HMAC-SHA256 signed QR
+      token for each (NFR-SEC-005). Tokens use the per-event signing
+      key. The signed payload: `ticketId|eventId|seatId|customerId|issuedAt`.
+
+      **VoidTickets** is the Step 5a compensation. The Booking Service
+      publishes this command during full saga reversal. The Ticket Service
+      marks all tickets for `bookingId` as `VOIDED` in PostgreSQL. A voided
+      ticket's QR token will fail verification at check-in (Check-in Service
+      validates ticket status via REST call on first scan if status is
+      uncertain — NFR-AVAIL-006 offline-first fallback).
+
+      **Idempotency (NFR-REL-002):**
+        IssueTickets: if tickets for `bookingId` already exist and are ISSUED,
+        return existing tickets without re-issuing (deduplication on bookingId).
+        VoidTickets: if tickets are already VOIDED, return success. If tickets
+        don't exist yet (race: void arrives before issue), record the void intent
+        and reject any future IssueTickets for this bookingId.
+
+      **Partition key: bookingId.**
+      Ensures IssueTickets and VoidTickets for the same booking land on the same
+      partition, preventing a race where VOID is processed before ISSUE by
+      different consumer thread instances.
+
+      **3-day retention:** Ticket issuance is synchronous to the booking saga
+      and should complete within seconds. 3 days provides adequate DLQ replay
+      window for incidents. Issued tickets are durable in PostgreSQL; the
+      Kafka message is ephemeral.
+    x-producer: booking-service
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - ticket-service-consumer
+    bindings:
+      kafka:
+        topic: ticket.commands
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 259200000    # 3 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketCommand
+      summary: Receive a ticket lifecycle command
+      message:
+        oneOf:
+          - $ref: '#/components/messages/IssueTickets'
+          - $ref: '#/components/messages/VoidTickets'
+
+  # ----------------------------------------------------------
+  # ticket.events
+  # 12 partitions, key=ticketId, 30-day retention
+  # ----------------------------------------------------------
+  ticket.events:
+    description: |
+      State-change events published by the **Ticket Service** via Outbox
+      (ADR-005 Step 5a, NFR-REL-005). Two independent consumer groups:
+
+      **notification-service-consumer:**
+        On `TicketIssued`: assembles the confirmation email with the QR
+        code image (generated from `qrToken`) and PDF ticket attachment.
+        Also pushes a WebSocket event to the Customer's `user:{customerId}`
+        room: `{ type: "ticket.issued", ticketId, seatLabel, eventName }`.
+        Fire-and-forget — notification failure never blocks the saga
+        (NFR-AVAIL-001).
+
+        On `TicketVoided`: sends cancellation email/notification.
+
+      **check-in-service-consumer:**
+        Caches the `qrToken` metadata keyed by `ticketId` in its local
+        read-model (PostgreSQL). This pre-populates the fast-path for
+        offline QR verification (NFR-PERF-004: p99 < 200ms). The
+        Check-in Service does NOT need to call the Ticket Service REST API
+        at scan time if the token metadata is in cache.
+
+      **Partition key: ticketId.**
+      Keying by ticketId (not bookingId) means TicketIssued and TicketVoided
+      for the *same ticket* land on the same partition. Within a booking, tickets
+      for different seats are independent — they may be processed in parallel
+      by different consumer instances without ordering constraint. Only the
+      per-ticket sequence matters: ISSUED before VOIDED.
+
+      **30-day retention:** Notification Service needs to replay on
+      channel failure. Check-in Service uses this to rebuild its cache on
+      full restart. 30 days covers the gap between event announcement and
+      event date for most medium-lead events.
+    x-producer: ticket-service
+    x-kafka-partition-key: ticketId
+    x-consumer-groups:
+      - notification-service-consumer
+      - check-in-service-consumer
+    bindings:
+      kafka:
+        topic: ticket.events
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 2592000000   # 30 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketEvent
+      summary: Receive a ticket state-change event
+      message:
+        oneOf:
+          - $ref: '#/components/messages/TicketIssued'
+          - $ref: '#/components/messages/TicketVoided'
+
+  # ----------------------------------------------------------
+  # ticket.checked-in
+  # 12 partitions, key=ticketId, 90-day retention
+  # ----------------------------------------------------------
+  ticket.checked-in:
+    description: |
+      Published by the **Check-in Service** when a QR scan is validated.
+      Two independent consumer groups:
+
+      **analytics-service-consumer:**
+        Updates live attendance counters in ClickHouse. Feeds the
+        Organiser portal's real-time attendance view (NFR-OBS-005).
+        Also used for post-event no-show prediction model training
+        (Phase 5: Analytics Service → ML pipeline).
+
+      **notification-service-consumer:**
+        Pushes a real-time check-in count update to the Organiser's
+        `event:{eventId}` WebSocket room:
+          `{ type: "attendance.updated", checkedInCount: N, totalCapacity: M }`
+        Also emits to the Venue staff room for access management awareness.
+
+      **Idempotency (NFR-SEC-006):** The Check-in Service guarantees at-most-
+      once check-in per ticket at the DB layer (UNIQUE constraint on ticketId
+      in checked_in table). A duplicate QR scan returns success with
+      "already checked in" — no duplicate `ticket.checked-in` event is
+      published. The Kafka message count therefore equals the number of
+      unique checked-in tickets.
+
+      **verificationMethod field:** Distinguishes SIGNATURE_ONLY (hot path,
+      NFR-PERF-004 p99 < 200ms) from NETWORK_VERIFIED (fallback when offline
+      cache miss occurs — requires REST call to Ticket Service). Analytics
+      tracks the ratio to measure offline-path coverage.
+
+      **Partition key: ticketId.**
+      Consistent with ticket.events — ordering of ISSUED → CHECKED_IN per
+      ticket is maintained. 12 partitions match ticket.events for symmetric
+      consumer group sizing.
+
+      **90-day retention:** Forms part of the attendance audit trail. Needed
+      for no-show prediction model feature generation in Phase 5.
+    x-producer: check-in-service
+    x-kafka-partition-key: ticketId
+    x-consumer-groups:
+      - analytics-service-consumer
+      - notification-service-consumer
+    bindings:
+      kafka:
+        topic: ticket.checked-in
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 7776000000   # 90 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketCheckedIn
+      summary: Receive a ticket check-in event
+      message:
+        $ref: '#/components/messages/TicketCheckedIn'
+
+  # ----------------------------------------------------------
+  # DLQs — NFR-REL-007
+  # ----------------------------------------------------------
+  ticket.commands.dlq:
+    description: |
+      Dead-letter queue for `ticket.commands` (NFR-REL-007).
+      A dead-lettered IssueTickets means the Customer will not receive their
+      QR code. KafkaDLQDepthNonZero alert fires. Runbook: verify Ticket
+      Service PostgreSQL connectivity; replay after fix. Idempotent replay
+      is safe due to bookingId deduplication guard.
+    x-original-topic: ticket.commands
+    x-kafka-partition-key: bookingId
+    x-consumer-groups:
+      - ticket-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: ticket.commands.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketCommandDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  ticket.events.dlq:
+    description: |
+      Dead-letter queue for `ticket.events` (NFR-REL-007).
+      Dead-lettered TicketIssued means the Customer notification or the
+      Check-in cache pre-population failed. Check-in still works via
+      network fallback (NFR-AVAIL-006). Replay is safe; ticketId
+      deduplication prevents double notification.
+    x-original-topic: ticket.events
+    x-kafka-partition-key: ticketId
+    x-consumer-groups:
+      - ticket-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: ticket.events.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketEventDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  ticket.checked-in.dlq:
+    description: |
+      Dead-letter queue for `ticket.checked-in` (NFR-REL-007).
+      Dead-lettered events mean Analytics or Notification missed an attendance
+      update. Not operationally critical (check-in already recorded in DB)
+      but requires replay for accurate Grafana attendance counters.
+    x-original-topic: ticket.checked-in
+    x-kafka-partition-key: ticketId
+    x-consumer-groups:
+      - ticket-checked-in-dlq-consumer
+    bindings:
+      kafka:
+        topic: ticket.checked-in.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveTicketCheckedInDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+components:
+
+  messages:
+
+    IssueTickets:
+      messageId: IssueTickets
+      name: IssueTickets
+      title: Issue Tickets
+      summary: Issue HMAC-SHA256 signed QR tickets for all seats in a confirmed booking.
+      description: |
+        Consumed by the Ticket Service. For each seatId in `seatIds[]`, the
+        Ticket Service:
+          1. Generates a UUID ticketId
+          2. Constructs the signing payload: `ticketId|eventId|seatId|customerId|issuedAt`
+          3. Computes HMAC-SHA256 using the per-event secret (fetched from
+             Vault via event signing key service — key name: `event:{eventId}:ticket-key`)
+          4. Base64url-encodes the result as the `qrToken`
+          5. Writes the Ticket record to PostgreSQL (ISSUED state)
+          6. Publishes `ticket.events:ticket.issued` via Outbox
+
+        The `eventName`, `venueName`, `venueAddress`, and `eventDateTime` fields
+        are denormalized into this command so the Ticket Service does not need
+        to call the Event or Venue services during ticket generation (avoiding
+        a synchronous inter-service call in the async path).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/IssueTicketsPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    VoidTickets:
+      messageId: VoidTickets
+      name: VoidTickets
+      title: Void Tickets
+      summary: Void all tickets for a booking. Compensation for IssueTickets (ADR-005 Step 5a).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VoidTicketsPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    TicketIssued:
+      messageId: TicketIssued
+      name: TicketIssued
+      title: Ticket Issued
+      summary: A signed QR ticket has been issued for a specific seat in a booking.
+      description: |
+        Emitted once per seat. A booking for 3 seats produces 3 TicketIssued events
+        on the same topic, with the same bookingId but distinct ticketId and seatId.
+        The Notification Service collects all TicketIssued events for a booking
+        (using bookingId correlation) before assembling the final confirmation email.
+        It uses `totalTicketsInBooking` and `ticketIndexInBooking` to know when
+        all tickets have been received.
+
+        **qrToken:** The signed token string. Notification Service embeds this in the
+        QR code image (qrcode.react on frontend, or server-side QR generation for
+        PDF). The Check-in Service verifies this token at scan time (NFR-SEC-005).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/TicketIssuedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    TicketVoided:
+      messageId: TicketVoided
+      name: TicketVoided
+      title: Ticket Voided
+      summary: A ticket has been voided. Its QR token is no longer valid for check-in.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/TicketVoidedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    TicketCheckedIn:
+      messageId: TicketCheckedIn
+      name: TicketCheckedIn
+      title: Ticket Checked In
+      summary: A QR ticket has been scanned and the holder admitted to the event.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/TicketCheckedInPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      summary: Original message that failed after maximum retry attempts.
+      contentType: application/json
+      headers:
+        type: object
+        required: [x-failure-reason, x-original-topic, x-original-partition, x-original-offset, x-retry-count]
+        properties:
+          x-failure-reason:
+            type: string
+            example: 'DataIntegrityViolationException: could not execute statement'
+          x-original-topic:
+            type: string
+          x-original-partition:
+            type: integer
+          x-original-offset:
+            type: integer
+            format: int64
+          x-retry-count:
+            type: integer
+          x-event-type:
+            type: string
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+          example: TicketIssued
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+          example: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          example: '1.0.0'
+
+    MoneyAmount:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: 'INR'
+
+    IssueTicketsPayload:
+      type: object
+      required:
+        - messageId
+        - bookingId
+        - customerId
+        - eventId
+        - seatIds
+        - eventName
+        - eventDateTime
+        - venueName
+        - venueAddress
+        - totalAmountPaid
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Deduplication key (NFR-REL-002). Idempotency: if tickets for bookingId already ISSUED, return existing.
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatIds:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: string
+            format: uuid
+          description: Ordered list of seat UUIDs. One ticket emitted per entry.
+        seatLabels:
+          type: array
+          items:
+            type: string
+          description: |
+            Human-readable seat labels in same order as seatIds
+            (e.g., ["A12", "A13"]). Denormalized for Ticket Service convenience.
+        sectionNames:
+          type: array
+          items:
+            type: string
+          description: Section name for each seat in seatIds order (e.g., ["Pit", "Pit"]).
+        eventName:
+          type: string
+          maxLength: 256
+          description: Denormalized event name for ticket PDF / email rendering.
+        eventDateTime:
+          type: string
+          format: date-time
+          description: Event start datetime (UTC).
+        venueName:
+          type: string
+          maxLength: 256
+        venueAddress:
+          type: string
+          maxLength: 512
+        totalAmountPaid:
+          $ref: '#/components/schemas/MoneyAmount'
+          description: Total GST-inclusive amount paid by the Customer for all seats.
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    VoidTicketsPayload:
+      type: object
+      required:
+        - messageId
+        - bookingId
+        - reason
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+          description: Voids ALL tickets for this booking.
+        reason:
+          type: string
+          enum: [BOOKING_CANCELLED, FRAUD_DETECTED, ADMIN_OVERRIDE, EVENT_CANCELLED]
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    TicketIssuedPayload:
+      type: object
+      required:
+        - messageId
+        - ticketId
+        - bookingId
+        - customerId
+        - eventId
+        - seatId
+        - seatLabel
+        - sectionName
+        - eventName
+        - eventDateTime
+        - venueName
+        - qrToken
+        - qrTokenAlgorithm
+        - ticketStatus
+        - totalTicketsInBooking
+        - ticketIndexInBooking
+        - issuedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        ticketId:
+          type: string
+          format: uuid
+          description: Primary key of the issued Ticket record.
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+        seatLabel:
+          type: string
+          example: 'A12'
+        sectionName:
+          type: string
+          example: 'Pit'
+        eventName:
+          type: string
+        eventDateTime:
+          type: string
+          format: date-time
+        venueName:
+          type: string
+        qrToken:
+          type: string
+          description: |
+            Base64url-encoded HMAC-SHA256 signed token. Signed payload:
+            `ticketId|eventId|seatId|customerId|issuedAt` (pipe-delimited).
+            Key: per-event secret from Vault. NFR-SEC-005.
+            This token is embedded in the QR code image shown to the Customer.
+        qrTokenAlgorithm:
+          type: string
+          enum: [HMAC_SHA256]
+          description: |
+            Algorithm used for signing. Enumerated to allow future migration
+            to JWT without breaking consumers (additive schema evolution).
+        ticketStatus:
+          type: string
+          enum: [ISSUED]
+          description: Always ISSUED in this event. Separate TicketVoided event for voiding.
+        totalTicketsInBooking:
+          type: integer
+          minimum: 1
+          maximum: 8
+          description: Total number of tickets in this booking. Used by Notification Service to collect all tickets before sending confirmation email.
+        ticketIndexInBooking:
+          type: integer
+          minimum: 1
+          description: 1-based index of this ticket within the booking (1 of N).
+        issuedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    TicketVoidedPayload:
+      type: object
+      required:
+        - messageId
+        - ticketId
+        - bookingId
+        - customerId
+        - eventId
+        - seatId
+        - reason
+        - voidedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        ticketId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          enum: [BOOKING_CANCELLED, FRAUD_DETECTED, ADMIN_OVERRIDE, EVENT_CANCELLED]
+        voidedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    TicketCheckedInPayload:
+      type: object
+      required:
+        - messageId
+        - ticketId
+        - bookingId
+        - customerId
+        - eventId
+        - seatId
+        - seatLabel
+        - verificationMethod
+        - scannedByStaffId
+        - checkedInAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        ticketId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        seatId:
+          type: string
+          format: uuid
+        seatLabel:
+          type: string
+          example: 'A12'
+        verificationMethod:
+          type: string
+          enum: [SIGNATURE_ONLY, NETWORK_VERIFIED]
+          description: |
+            SIGNATURE_ONLY — hot path. QR token verified offline from cached
+              event key. No network call to Ticket Service (NFR-PERF-004).
+            NETWORK_VERIFIED — fallback. Check-in Service made a REST call
+              to Ticket Service to verify token (cache miss or first scan
+              of the day). NFR-AVAIL-006: offline fallback still works.
+        scannedByStaffId:
+          type: string
+          format: uuid
+          description: UUID of the venue staff member who performed the scan.
+        deviceId:
+          type: string
+          description: Optional. Check-in device identifier for forensics.
+        checkedInAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'

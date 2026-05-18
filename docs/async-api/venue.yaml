@@ -1,0 +1,562 @@
+# ============================================================
+# venue.yaml
+#
+# AsyncAPI 2.6 contract — Venue Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/venue.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (venue domain table)
+#   ADR-008 §2.6    — Venue suspension cascade: the most complex multi-level
+#                     saga in the platform. VenueSuspended → EventCancelled
+#                     (×N events) → booking.refund-requested (×M bookings per
+#                     event). Level 1 of the cascade originates here.
+#   NFR-REL-002     — messageId in every payload
+#   NFR-REL-007     — DLQ per topic
+#   NFR-REL-011     — Cascade idempotency
+#
+# VENUE SUSPENSION CASCADE (the hardest compensation in StagePass):
+#   VenueSuspended triggers a two-level cascade (ADR-008 §3.7):
+#
+#   Level 1: Event Service (event-service-consumer of venue.events)
+#     For each upcoming event at venueId:
+#       → publishes event.commands:CancelEvent (or directly event.events:EventCancelled)
+#     A venue with 5 upcoming events emits 5 CancelEvent commands.
+#     Idempotency: if the event is already CANCELLED, skip (NFR-REL-011).
+#
+#   Level 2: Booking Service (booking-service-consumer of event.events:EventCancelled)
+#     For each event cancellation: fan-out of booking.refund-requested ×M bookings.
+#     A venue with 5 events × 200 bookings = 1,000 refund messages.
+#
+#   This cascade must be idempotent at every level. The idempotency key at
+#   each level: eventId at Level 1, bookingId at Level 2.
+#   A consumer crash at Level 1 partway through produces duplicate
+#   EventCancelled messages for events already processed — Level 2 idempotency
+#   (booking state check) absorbs this safely (NFR-REL-011).
+#
+# Topics covered:
+#   venue.events      (6 partitions, key=venueId, 30 days)
+#   venue.events.dlq  (6 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:venue'
+
+info:
+  title: StagePass — Venue Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Venue domain** Kafka topics.
+
+    **Publisher:** Venue Service (NestJS). Events are published via Outbox
+    (NFR-REL-005) after state transitions are committed to MongoDB.
+
+    **`venue.events` consumer groups:**
+      - event-service-consumer: reacts to VenueSuspended (cascade Level 1),
+        VenueActivated, VenueUpdated (date availability changes).
+      - search-service-consumer: indexes/updates venue document in
+        Elasticsearch for venue discovery and event search enrichment.
+
+    **VenueSuspended is the highest-severity event in the venue domain.**
+    It triggers a multi-level compensation cascade that is the most complex
+    saga in the entire platform (ADR-008 §2.6, §3.7.3). The Event Service
+    consumer must be designed for the worst case: a venue with 10 events,
+    each with 500 confirmed bookings = 5,000 downstream refund messages
+    cascading from a single VenueSuspended event.
+
+    **Partition key: venueId.**
+    All venue lifecycle events for one venue land on the same partition.
+    Consumers observe VenueActivated → VenueSuspended in order — preventing
+    the Elasticsearch consumer from re-indexing a suspended venue after it
+    was correctly de-indexed. 6 partitions reflect the lower volume of the
+    venue domain relative to booking/event domains.
+
+    **30-day retention:** The Search Service uses venue.events to rebuild
+    its venue index on restart. 30 days covers the venue onboarding and
+    management lifecycle for replaying from a clean index.
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server
+
+channels:
+
+  # ----------------------------------------------------------
+  # venue.events
+  # 6 partitions, key=venueId, 30-day retention
+  # ----------------------------------------------------------
+  venue.events:
+    description: |
+      State-change events published by the **Venue Service** via Outbox.
+      Two independent consumer groups:
+
+      **event-service-consumer:**
+        VenueSuspended: For each upcoming event at this venueId (queried
+          from Event Service's own MongoDB), publishes a CancelEvent command
+          to event.commands. This is the Level 1 cascade trigger (ADR-008 §2.6).
+          The Event Service must query all events with status IN
+          (PUBLISHED, SOLD_OUT, POSTPONED) and startDateTime > NOW().
+          Idempotency: events already CANCELLED are skipped.
+        VenueActivated: No cascade action. May trigger availability
+          notifications if waitlisted organisers exist (Phase 4 feature).
+        VenueUpdated: Updates Event Service's cached venue metadata
+          (denormalized venueName, venueAddress in event documents).
+        VenueBookingAccepted: Creates the confirmed venue booking record
+          in the Event Service context (completes the Organiser–Venue
+          booking negotiation flow).
+
+      **search-service-consumer:**
+        VenueSuspended: Mark venue as SUSPENDED in Elasticsearch (hidden
+          from search results). Associated events should also be de-indexed
+          — the event-service-consumer cascade will emit EventCancelled,
+          which the search-service-consumer for event.events handles.
+        VenueActivated: Restore venue in Elasticsearch.
+        VenueUpdated: Update venue document with changed fields.
+
+      **Why no booking-service-consumer here?**
+      The Booking Service does not directly consume venue.events. It reacts
+      to EventCancelled events (from event.events) which are triggered by
+      the Event Service in response to VenueSuspended. This preserves the
+      single-responsibility of each consumer and keeps the cascade graph
+      explicit: Venue → Event → Booking (not Venue → Booking directly).
+      This separation means a partial venue suspension cascade can be
+      observed and debugged at each level independently.
+    x-producer: venue-service
+    x-kafka-partition-key: venueId
+    x-consumer-groups:
+      - event-service-consumer
+      - search-service-consumer
+    bindings:
+      kafka:
+        topic: venue.events
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 2592000000   # 30 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveVenueEvent
+      summary: Receive a venue state-change event
+      message:
+        oneOf:
+          - $ref: '#/components/messages/VenueSuspended'
+          - $ref: '#/components/messages/VenueActivated'
+          - $ref: '#/components/messages/VenueUpdated'
+          - $ref: '#/components/messages/VenueBookingAccepted'
+          - $ref: '#/components/messages/VenueBookingRejected'
+
+  # ----------------------------------------------------------
+  # venue.events.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  venue.events.dlq:
+    description: |
+      Dead-letter queue for `venue.events` (NFR-REL-007).
+
+      **CRITICAL SEVERITY for VenueSuspended DLQ messages.**
+      A dead-lettered VenueSuspended in the event-service-consumer group
+      means the cascade Level 1 did NOT execute — upcoming events at the
+      suspended venue remain PUBLISHED and customers may continue booking.
+      This is a financial and reputational risk. KafkaDLQDepthNonZero alert
+      must page on-call immediately for this topic.
+
+      **Replay safety:** The VenueSuspended cascade is idempotent at Level 1
+      (Event Service skips already-CANCELLED events). Safe to replay after
+      Event Service recovery. Verify event states before acknowledging alert.
+
+      **Lower severity for VenueUpdated:** A dead-lettered VenueUpdated
+      means Elasticsearch venue document is stale (cosmetic). Replay when
+      convenient; no financial risk.
+    x-original-topic: venue.events
+    x-kafka-partition-key: venueId
+    x-consumer-groups:
+      - venue-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: venue.events.dlq
+        partitions: 6
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveVenueEventDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+components:
+
+  messages:
+
+    VenueSuspended:
+      messageId: VenueSuspended
+      name: VenueSuspended
+      title: Venue Suspended
+      summary: |
+        A venue has been suspended by Admin. Triggers Level 1 of the
+        multi-level cascade: all upcoming events at this venue are cancelled.
+      description: |
+        This is the highest-severity message in the venue domain. Consumers
+        must treat it with the highest processing priority. The Event Service
+        consumer's response (cascade Level 1) is the most complex operation
+        triggered by a single message in the entire platform.
+
+        **`affectedUpcomingEventsCount`:** Informational. The Event Service
+        queries its own MongoDB for the actual list — it does not rely on
+        this count for correctness. Used by monitoring to estimate cascade
+        fanout before it begins.
+
+        **Admin audit:** `suspendedByAdminId` is mandatory. Every venue
+        suspension must be traceable to an Admin action. There is no automated
+        venue suspension path in v1.0.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VenueSuspendedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    VenueActivated:
+      messageId: VenueActivated
+      name: VenueActivated
+      title: Venue Activated
+      summary: A suspended venue has been reinstated by Admin.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VenueActivatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    VenueUpdated:
+      messageId: VenueUpdated
+      name: VenueUpdated
+      title: Venue Updated
+      summary: Venue metadata has changed (name, address, capacity). Update search index.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VenueUpdatedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    VenueBookingAccepted:
+      messageId: VenueBookingAccepted
+      name: VenueBookingAccepted
+      title: Venue Booking Accepted
+      summary: |
+        A Venue has accepted an Organiser's booking request for a specific date.
+        The joint event context is now established.
+      description: |
+        This event completes the Organiser–Venue booking negotiation flow
+        (PRD §3.1). After this event, the Organiser can configure the event
+        (seat map, ticketing) and eventually publish it. The Event Service
+        consumer uses this to update the event record's venue booking status
+        from PENDING to ACCEPTED.
+
+        **venueShareRate** is locked at acceptance time — this is the rate
+        used in all RevenueSplit computations for bookings at this event
+        (ADR-004 §3.6, ADR-005 §3.8). It cannot change after acceptance.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VenueBookingAcceptedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    VenueBookingRejected:
+      messageId: VenueBookingRejected
+      name: VenueBookingRejected
+      title: Venue Booking Rejected
+      summary: A Venue has rejected an Organiser's booking request.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/VenueBookingRejectedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      contentType: application/json
+      headers:
+        type: object
+        required: [x-failure-reason, x-original-topic, x-original-partition, x-original-offset, x-retry-count]
+        properties:
+          x-failure-reason:
+            type: string
+          x-original-topic:
+            type: string
+          x-original-partition:
+            type: integer
+          x-original-offset:
+            type: integer
+            format: int64
+          x-retry-count:
+            type: integer
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+          example: VenueSuspended
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          example: '1.0.0'
+
+    VenueSuspendedPayload:
+      type: object
+      required:
+        - messageId
+        - venueId
+        - suspendedByAdminId
+        - reason
+        - affectedUpcomingEventsCount
+        - suspendedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        suspendedByAdminId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          maxLength: 1000
+        affectedUpcomingEventsCount:
+          type: integer
+          minimum: 0
+          description: |
+            Informational estimate of cascade fanout. Not used for correctness —
+            the Event Service queries its own MongoDB for the actual list.
+        suspendedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    VenueActivatedPayload:
+      type: object
+      required:
+        - messageId
+        - venueId
+        - activatedByAdminId
+        - activatedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        activatedByAdminId:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          nullable: true
+        activatedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    VenueUpdatedPayload:
+      type: object
+      required:
+        - messageId
+        - venueId
+        - updatedFields
+        - updatedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        updatedFields:
+          type: array
+          items:
+            type: string
+          description: |
+            Names of fields that changed (e.g., ["name", "address", "totalCapacity"]).
+            Consumers use this to perform partial updates — only re-index
+            fields that changed.
+          example: ['name', 'address']
+        venueName:
+          type: string
+          nullable: true
+          description: New value if name was updated; null otherwise.
+        venueCity:
+          type: string
+          nullable: true
+        totalCapacity:
+          type: integer
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    VenueBookingAcceptedPayload:
+      type: object
+      required:
+        - messageId
+        - venueBookingId
+        - venueId
+        - organiserId
+        - eventId
+        - eventDate
+        - venueShareRate
+        - acceptedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        venueBookingId:
+          type: string
+          format: uuid
+          description: Primary key of the VenueBooking record.
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            The event being planned at this venue. Created by the Organiser
+            before the venue booking request; linked at acceptance.
+        eventDate:
+          type: string
+          format: date
+          description: The booked date (ISO-8601 date, not datetime — time TBD by Organiser).
+        venueShareRate:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          description: |
+            Negotiated venue revenue share rate, locked at acceptance (ADR-004 §3.6).
+            IMMUTABLE after this event. Used in all RevenueSplit computations
+            for bookings at this event. "0.2000" = 20%.
+          example: '0.2000'
+        acceptedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    VenueBookingRejectedPayload:
+      type: object
+      required:
+        - messageId
+        - venueBookingId
+        - venueId
+        - organiserId
+        - eventId
+        - rejectionReason
+        - rejectedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        venueBookingId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        rejectionReason:
+          type: string
+          maxLength: 500
+        rejectedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'

@@ -1,0 +1,365 @@
+# ============================================================
+# notification.yaml
+#
+# AsyncAPI 2.6 contract — Notification Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/notification.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (notification domain table)
+#   NFR-AVAIL-001   — Notification Service down → bookings still complete
+#   NFR-REL-002     — messageId in every payload
+#   NFR-REL-007     — DLQ per topic
+#
+# ARCHITECTURAL ROLE:
+#   The Notification Service (raw Node.js + Socket.IO) is a *delivery router*,
+#   not a business logic service. It receives typed SendNotification commands
+#   and dispatches to one or more delivery channels:
+#     - WebSocket (Socket.IO rooms scoped to userId or eventId)
+#     - Email (via transactional email provider — e.g. SendGrid, Phase 4)
+#     - SMS   (via SMS provider — e.g. Twilio, Phase 4)
+#
+#   Multiple upstream services publish to this topic. Every saga step that
+#   emits a customer-facing notification does so via this topic, keeping the
+#   Notification Service as the single delivery point. This prevents:
+#     1. Duplicate notifications (the Notification Service deduplicates on
+#        messageId before dispatching)
+#     2. Scattered email/SMS logic across multiple services
+#
+#   NOTE: Most upstream services do NOT publish directly to notification.commands.
+#   Instead, they publish to their own domain topics (booking.events,
+#   ticket.events, disbursement.events) which the Notification Service
+#   *subscribes to* via its own consumer groups in those topics.
+#   The notification.commands topic is used for:
+#     - Notifications that have no corresponding domain event (e.g., Admin
+#       broadcasts, promotional messages, platform health alerts)
+#     - Direct notification triggers from services that lack a domain event
+#       for a specific notification (e.g., Chatbot completion notification)
+#
+# Topics covered:
+#   notification.commands      (12 partitions, key=userId, 1 day)
+#   notification.commands.dlq  (12 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:notification'
+
+info:
+  title: StagePass — Notification Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Notification domain** Kafka topics.
+
+    **Delivery model:** The Notification Service routes each command to the
+    appropriate delivery channel(s). It maintains a Socket.IO connection pool
+    via Redis adapter for horizontal scaling (ADR-002 Redis usage). WebSocket
+    delivery is the primary channel for real-time booking updates; email/SMS
+    are secondary channels for record and out-of-band delivery.
+
+    **Partition key: userId.**
+    All notifications for a single user land on the same partition. The
+    Notification Service consumer emits WebSocket events to the user's
+    Socket.IO room in strict partition order. This ensures a user sees
+    "booking pending" before "booking confirmed" — not the reverse
+    (ADR-003 §3.4.2 partition key rationale).
+
+    **Fire-and-forget guarantee (NFR-AVAIL-001):** Publishing to this
+    topic is the final step for all saga-linked notifications. Saga steps
+    never await delivery confirmation from this topic's consumer. If the
+    Notification Service is down, bookings complete normally; the user
+    receives a delayed notification when the service recovers.
+
+    **Idempotency:** The Notification Service deduplicates on `messageId`
+    before dispatching. Re-delivery of the same command (at-least-once
+    Kafka guarantee) will not send duplicate emails or push duplicate
+    WebSocket events.
+
+    **Schema evolution:** Additive only. The `templateData` field uses an
+    open-ended object to accommodate future notification types without a
+    schema break. Consumers must tolerate unknown `notificationType` values
+    by logging and no-oping (tolerant reader, Kleppmann DDIA §4).
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server
+
+channels:
+
+  # ----------------------------------------------------------
+  # notification.commands
+  # 12 partitions, key=userId, 1-day retention
+  # ----------------------------------------------------------
+  notification.commands:
+    description: |
+      Direct notification commands published to the Notification Service
+      for cases where no domain event exists for the notification.
+
+      **Publishers:**
+        - Admin Console (broadcast messages, platform alerts)
+        - Fraud Detection Service (CRITICAL risk flag for Admin dashboard)
+        - Any service needing a direct notification not covered by
+          the domain event fan-out pattern
+
+      **Note on domain event fan-out:**
+      Most notifications are delivered via the Notification Service consuming
+      other domain topics directly (booking.events, ticket.events,
+      disbursement.events, waitlist.events, fraud.score-results). This topic
+      is the *overflow valve* for notifications without a natural domain event.
+      Adding a new notification type should default to adding a consumer on
+      the relevant domain topic — NOT adding a publisher to this topic.
+
+      **Channel usage (WebSocket rooms):**
+        userId-scoped:  `user:{userId}` — personal notifications
+        eventId-scoped: `event:{eventId}` — Organiser/Venue operational feed
+
+      **Delivery channels per notificationType:**
+        - BOOKING_CONFIRMED: WebSocket + Email
+        - BOOKING_CANCELLED: WebSocket + Email
+        - TICKET_ISSUED: WebSocket (QR delivery via email from ticket.events consumer)
+        - FRAUD_ADMIN_ALERT: WebSocket (Admin dashboard room) + Email to Admin
+        - DISBURSEMENT_COMPLETED: WebSocket (Organiser/Venue portal) + Email
+        - DISBURSEMENT_FAILED: WebSocket (Admin dashboard) + Email to Admin
+        - EVENT_CANCELLED: WebSocket + Email + SMS
+        - EVENT_POSTPONED: WebSocket + Email
+        - ADMIN_BROADCAST: Email to affected segment
+
+      **1-day retention:** Notifications are time-sensitive. A notification
+      for a booking confirmation is worthless 24 hours later. DLQ replay
+      should only restore notifications from incidents within the same day.
+    x-producer: admin-console, fraud-detection-service
+    x-kafka-partition-key: userId
+    x-consumer-groups:
+      - notification-service-consumer
+    bindings:
+      kafka:
+        topic: notification.commands
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 86400000     # 1 day — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveNotificationCommand
+      summary: Receive a direct notification command
+      message:
+        $ref: '#/components/messages/SendNotification'
+
+  # ----------------------------------------------------------
+  # notification.commands.dlq — NFR-REL-007
+  # ----------------------------------------------------------
+  notification.commands.dlq:
+    description: |
+      Dead-letter queue for `notification.commands` (NFR-REL-007).
+      Notification delivery failures are low-severity compared to
+      financial operations, but Admin broadcast failures and fraud alerts
+      are operationally important. KafkaDLQDepthNonZero alert fires.
+      Replay within 1 day (retention limit) is safe due to messageId
+      deduplication. Post-1-day replay is not useful (stale content).
+    x-original-topic: notification.commands
+    x-kafka-partition-key: userId
+    x-consumer-groups:
+      - notification-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: notification.commands.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveNotificationCommandDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+components:
+
+  messages:
+
+    SendNotification:
+      messageId: SendNotification
+      name: SendNotification
+      title: Send Notification
+      summary: Command to deliver a notification to a user via one or more channels.
+      description: |
+        The Notification Service discriminates delivery behaviour by
+        `notificationType` + `deliveryChannels`. The `templateData` object
+        carries the data needed to render the notification in each channel.
+
+        **Adding new notification types:**
+        Add the enum value to `notificationType` and document the expected
+        `templateData` fields in a comment or companion document. The
+        Notification Service must tolerate unknown types by logging at WARN
+        and no-oping (never dead-lettering on unknown type alone).
+
+        **WebSocket room targeting:**
+        For `userId`-scoped notifications: room = `user:{targetUserId}`.
+        For `eventId`-scoped notifications (Organiser/Venue/Admin):
+          room = `event:{eventId}` — include `eventId` in `templateData`.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/SendNotificationPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      contentType: application/json
+      headers:
+        type: object
+        required: [x-failure-reason, x-original-topic, x-original-partition, x-original-offset, x-retry-count]
+        properties:
+          x-failure-reason:
+            type: string
+          x-original-topic:
+            type: string
+          x-original-partition:
+            type: integer
+          x-original-offset:
+            type: integer
+            format: int64
+          x-retry-count:
+            type: integer
+          x-event-type:
+            type: string
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+          example: SendNotification
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          example: '1.0.0'
+
+    SendNotificationPayload:
+      type: object
+      required:
+        - messageId
+        - targetUserId
+        - notificationType
+        - deliveryChannels
+        - templateData
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: |
+            Deduplication key (NFR-REL-002). The Notification Service
+            records delivered messageIds with a TTL of 24h in Redis to
+            prevent duplicate delivery on at-least-once redelivery.
+        targetUserId:
+          type: string
+          format: uuid
+          description: |
+            The user to notify. Used to resolve Socket.IO room and
+            to look up email/phone in the User profile (via Auth Service
+            REST call — cached, not per-message). Also used as the Kafka
+            message partition key.
+        notificationType:
+          type: string
+          enum:
+            - BOOKING_CONFIRMED
+            - BOOKING_CANCELLED
+            - TICKET_ISSUED
+            - DISBURSEMENT_COMPLETED
+            - DISBURSEMENT_FAILED
+            - EVENT_CANCELLED
+            - EVENT_POSTPONED
+            - FRAUD_ADMIN_ALERT
+            - WAITLIST_OFFER_RECEIVED
+            - WAITLIST_OFFER_EXPIRED
+            - ADMIN_BROADCAST
+          description: |
+            Determines the email template, SMS copy, and WebSocket event type
+            used for delivery. The Notification Service maps each type to
+            template IDs in its configuration. Unknown values: log WARN, no-op.
+        deliveryChannels:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [WEBSOCKET, EMAIL, SMS]
+          description: |
+            One or more delivery channels for this notification.
+            Publishers specify the intended channels; the Notification
+            Service is the authority on what is actually deliverable
+            (e.g., if user has no verified phone, SMS is skipped silently).
+        templateData:
+          type: object
+          additionalProperties: true
+          description: |
+            Key-value pairs for rendering the notification template.
+            Exact fields vary by notificationType. Common fields:
+              bookingId (uuid), eventId (uuid), eventName (string),
+              seatLabels (string[]), totalAmount (MoneyAmount object),
+              cancellationReason (string), disbursedAmount (MoneyAmount),
+              payoutReference (string).
+            The Notification Service renders with a null-safe renderer;
+            missing template keys produce empty strings (never crash).
+        priority:
+          type: string
+          enum: [HIGH, NORMAL, LOW]
+          default: NORMAL
+          description: |
+            HIGH — deliver immediately (fraud alerts, booking confirmations).
+            NORMAL — batch with other notifications (analytics digests).
+            LOW — best-effort (promotional, admin broadcasts).
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'

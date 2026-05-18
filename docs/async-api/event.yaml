@@ -1,0 +1,822 @@
+# ============================================================
+# event.yaml
+#
+# AsyncAPI 2.6 contract — Event Domain Kafka topics
+#
+# Repo:    stagepass-docs
+# Path:    /docs/async-api/event.yaml
+# Version: 1.0.0
+# Status:  Accepted
+# Phase:   1 — Design
+#
+# References:
+#   ADR-003 §3.4.2  — Topic catalogue (event domain table)
+#   ADR-008 §2.6    — Venue suspension cascade: venue.events → event.events
+#                     → booking.refund-requested (multi-level saga)
+#   NFR-PERF-010    — Published events indexed in Elasticsearch within 30s
+#   NFR-REL-002     — messageId in every payload
+#   NFR-REL-007     — DLQ per topic
+#   NFR-REL-011     — Cascade cancellation saga idempotency
+#
+# EVENT CANCELLATION CASCADE (ADR-008 §2.6, §3.7):
+#   EventCancelled is the most consequential event in this domain.
+#   When consumed by the Booking Service, it triggers a fan-out of
+#   booking.refund-requested messages — one per confirmed booking for
+#   this event. For an event with 500 confirmed bookings, this produces
+#   500 Kafka messages downstream. The Booking Service must:
+#     1. Query all CONFIRMED bookings for eventId
+#     2. For each: transition to REFUND_REQUESTED (if not already CANCELLED)
+#     3. Publish booking.refund-requested (idempotent per NFR-REL-011)
+#   This is idempotent: a second EventCancelled for the same eventId produces
+#   no duplicate refunds because the booking state check gates re-entry.
+#
+# Topics covered:
+#   event.commands      (12 partitions, key=eventId, 7 days)
+#   event.events        (12 partitions, key=eventId, 30 days)
+#   event.commands.dlq  (12 partitions, 14-day retention)
+#   event.events.dlq    (12 partitions, 14-day retention)
+#
+# Changelog:
+#   1.0.0  2025-01-15  Initial — Phase 1 design
+# ============================================================
+
+asyncapi: '2.6.0'
+
+id: 'urn:stagepass:asyncapi:event'
+
+info:
+  title: StagePass — Event Domain Kafka Contracts
+  version: '1.0.0'
+  description: |
+    Async message contracts for the **Event domain** Kafka topics.
+
+    **Publisher of event.commands:** Admin Console and Organiser Portal
+    (via API Gateway → Event Service REST → Kafka publish, or direct Kafka
+    publish from Admin console). The Event Service is the sole consumer.
+
+    **Publisher of event.events:** Event Service (NestJS). Events are
+    published via Outbox (NFR-REL-005) after each state transition is
+    committed to MongoDB. Five independent consumer groups fan-out:
+      - search-service-consumer: indexes/de-indexes event in Elasticsearch
+      - recommendation-service-consumer: invalidates recommendation caches
+      - analytics-service-consumer: records event lifecycle metrics in ClickHouse
+      - booking-service-consumer: triggers refund cascade on EventCancelled
+      - seat-inventory-service-consumer: releases all seats on EventCancelled
+
+    **Partition key: eventId (both topics).**
+    All commands and events for one event land on the same partition. Each
+    consumer group observes event lifecycle transitions in order:
+    DRAFT → PUBLISHED → CANCELLED. This ordering is critical for the
+    Search Service (must not re-index a cancelled event published out of order)
+    and for the Booking Service cascade (must not process cancellation before
+    the event was PUBLISHED and has confirmed bookings).
+
+    **30-day retention on event.events:** Search Service uses this topic as
+    a replay source to rebuild the Elasticsearch index after an index corruption.
+    30 days provides a full rebuild window for events announced in advance.
+    Long-term event history is in ClickHouse (Analytics Service).
+  license:
+    name: Internal — StagePass Platform
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  production:
+    url: '{bootstrapServer}'
+    protocol: kafka
+    variables:
+      bootstrapServer:
+        description: MSK bootstrap server
+
+channels:
+
+  # ----------------------------------------------------------
+  # event.commands
+  # 12 partitions, key=eventId, 7-day retention
+  # ----------------------------------------------------------
+  event.commands:
+    description: |
+      Commands published to the **Event Service** from Admin Console and
+      Organiser Portal. The Event Service is the sole authority on event
+      state transitions — no other service may directly mutate event state.
+
+      **Command types:**
+        `PublishEvent` — Organiser or Admin publishes a DRAFT event to PUBLISHED.
+          Pre-conditions: venue booking ACCEPTED, seat map configured,
+          ticket pricing set. Validated by Event Service before transition.
+        `CancelEvent` — Admin or Organiser cancels a PUBLISHED event.
+          Triggers EventCancelled event → booking refund cascade (ADR-008 §2.6).
+          A CANCELLED event cannot be uncancelled.
+        `PostponeEvent` — Admin or Organiser postpones an event to a new datetime.
+          Triggers EventPostponed event → Customer notifications.
+          Does NOT trigger refunds (booking remains CONFIRMED).
+        `UpdateEventStatus` — Generic admin status transition for operations
+          not covered by the specific commands above (e.g., COMPLETED, SUSPENDED).
+
+      **Idempotency:** Event Service deduplicates on `messageId`. If the same
+      command is re-delivered (DLQ replay), the state check prevents double-
+      transition: if already CANCELLED, CancelEvent returns success.
+    x-producer: admin-console, organiser-portal
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - event-service-consumer
+    bindings:
+      kafka:
+        topic: event.commands
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 604800000    # 7 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveEventCommand
+      summary: Receive an event lifecycle command
+      message:
+        oneOf:
+          - $ref: '#/components/messages/PublishEvent'
+          - $ref: '#/components/messages/CancelEvent'
+          - $ref: '#/components/messages/PostponeEvent'
+          - $ref: '#/components/messages/UpdateEventStatus'
+
+  # ----------------------------------------------------------
+  # event.events
+  # 12 partitions, key=eventId, 30-day retention
+  # ----------------------------------------------------------
+  event.events:
+    description: |
+      State-change events published by the **Event Service** via Outbox
+      (NFR-REL-005). Five independent consumer groups (Kafka fan-out):
+
+      **search-service-consumer (NFR-PERF-010 ≤ 30s indexing):**
+        EventPublished → index event document in Elasticsearch.
+        EventCancelled, EventStatusChanged → de-index or update status field.
+        EventPostponed → update startDateTime in index (partial update).
+        EventUpdated → update modified fields in index.
+        Search indexing latency alert: SearchIndexingLatencyHigh.
+
+      **recommendation-service-consumer:**
+        EventPublished → add event to recommendation feature store.
+        EventCancelled → remove from recommendations; invalidate Redis caches
+          for any user who had this event in their recommended list.
+        EventPostponed → update datetime in feature store.
+
+      **analytics-service-consumer:**
+        All event types → write event_lifecycle ClickHouse row.
+        EventCancelled → write cancellation metric with affected booking count.
+
+      **booking-service-consumer (cascade — ADR-008 §2.6):**
+        EventCancelled ONLY: triggers fan-out of booking.refund-requested
+          messages for all CONFIRMED bookings. This is the highest-fanout
+          operation in the platform. The consumer checks booking states
+          idempotently (NFR-REL-011) before publishing refund requests.
+
+      **seat-inventory-service-consumer:**
+        EventCancelled ONLY: releases all seats for this event in Redis and
+          PostgreSQL (bulk AVAILABLE ← HELD/BOOKED state reset). This happens
+          in parallel with the Booking Service fan-out; both must be idempotent.
+    x-producer: event-service
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - search-service-consumer
+      - recommendation-service-consumer
+      - analytics-service-consumer
+      - booking-service-consumer
+      - seat-inventory-service-consumer
+    bindings:
+      kafka:
+        topic: event.events
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 2592000000   # 30 days — ADR-003 §3.4.2
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveEventEvent
+      summary: Receive an event state-change notification
+      message:
+        oneOf:
+          - $ref: '#/components/messages/EventPublished'
+          - $ref: '#/components/messages/EventCancelled'
+          - $ref: '#/components/messages/EventPostponed'
+          - $ref: '#/components/messages/EventStatusChanged'
+
+  # ----------------------------------------------------------
+  # DLQs — NFR-REL-007
+  # ----------------------------------------------------------
+  event.commands.dlq:
+    description: |
+      Dead-letter queue for `event.commands` (NFR-REL-007).
+      A dead-lettered CancelEvent is HIGH severity: the event may remain
+      in PUBLISHED state while customers continue booking. KafkaDLQDepthNonZero
+      alert fires. Runbook: manual Event Service REST call to cancel event
+      and verify state before replaying from DLQ.
+    x-original-topic: event.commands
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - event-commands-dlq-consumer
+    bindings:
+      kafka:
+        topic: event.commands.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveEventCommandDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+  event.events.dlq:
+    description: |
+      Dead-letter queue for `event.events` (NFR-REL-007).
+      A dead-lettered EventCancelled for booking-service-consumer is CRITICAL:
+      refunds are not being issued for cancelled event bookings. Escalate
+      immediately. For search-service-consumer: cancelled event remains in
+      search index (cosmetic, lower severity). Per-consumer DLQ monitoring
+      via consumer group lag metrics distinguishes which group failed.
+    x-original-topic: event.events
+    x-kafka-partition-key: eventId
+    x-consumer-groups:
+      - event-events-dlq-consumer
+    bindings:
+      kafka:
+        topic: event.events.dlq
+        partitions: 12
+        replicas: 3
+        topicConfiguration:
+          retention.ms: 1209600000
+          cleanup.policy: delete
+    subscribe:
+      operationId: receiveEventEventDLQ
+      message:
+        $ref: '#/components/messages/DeadLetteredMessage'
+
+components:
+
+  messages:
+
+    PublishEvent:
+      messageId: PublishEvent
+      name: PublishEvent
+      title: Publish Event
+      summary: Transition event from DRAFT to PUBLISHED state.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PublishEventPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    CancelEvent:
+      messageId: CancelEvent
+      name: CancelEvent
+      title: Cancel Event
+      summary: Cancel a published event. Triggers booking refund cascade (ADR-008 §2.6).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/CancelEventPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    PostponeEvent:
+      messageId: PostponeEvent
+      name: PostponeEvent
+      title: Postpone Event
+      summary: Postpone event to a new datetime. Does not trigger refunds.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/PostponeEventPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    UpdateEventStatus:
+      messageId: UpdateEventStatus
+      name: UpdateEventStatus
+      title: Update Event Status
+      summary: Generic Admin status transition (e.g., COMPLETED, UNDER_REVIEW).
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/UpdateEventStatusPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    EventPublished:
+      messageId: EventPublished
+      name: EventPublished
+      title: Event Published
+      summary: An event is now live and discoverable by customers.
+      description: |
+        Carries full event metadata for search indexing (NFR-PERF-010:
+        indexed within 30s) and recommendation feature store population.
+        Price range is denormalized for search filter support.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/EventPublishedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    EventCancelled:
+      messageId: EventCancelled
+      name: EventCancelled
+      title: Event Cancelled
+      summary: |
+        An event has been cancelled. Triggers booking refund cascade and
+        seat release (ADR-008 §2.6). Highest-fanout event in the platform.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/EventCancelledPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    EventPostponed:
+      messageId: EventPostponed
+      name: EventPostponed
+      title: Event Postponed
+      summary: Event date/time has changed. Customers are notified; bookings remain confirmed.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/EventPostponedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    EventStatusChanged:
+      messageId: EventStatusChanged
+      name: EventStatusChanged
+      title: Event Status Changed
+      summary: Generic event status transition for analytics and search index updates.
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/StagePassMessageHeaders'
+      payload:
+        $ref: '#/components/schemas/EventStatusChangedPayload'
+      bindings:
+        kafka:
+          key:
+            type: string
+            format: uuid
+
+    DeadLetteredMessage:
+      name: DeadLetteredMessage
+      title: Dead-Lettered Message
+      contentType: application/json
+      headers:
+        type: object
+        required: [x-failure-reason, x-original-topic, x-original-partition, x-original-offset, x-retry-count]
+        properties:
+          x-failure-reason:
+            type: string
+          x-original-topic:
+            type: string
+          x-original-partition:
+            type: integer
+          x-original-offset:
+            type: integer
+            format: int64
+          x-retry-count:
+            type: integer
+          x-correlation-id:
+            type: string
+            format: uuid
+          x-traceparent:
+            type: string
+          x-produced-at:
+            type: string
+            format: date-time
+      payload:
+        type: object
+        additionalProperties: true
+
+  schemas:
+
+    StagePassMessageHeaders:
+      type: object
+      required: [x-event-type, x-correlation-id, x-traceparent, x-produced-at, x-schema-version]
+      properties:
+        x-event-type:
+          type: string
+        x-correlation-id:
+          type: string
+          format: uuid
+        x-traceparent:
+          type: string
+        x-tracestate:
+          type: string
+        x-produced-at:
+          type: string
+          format: date-time
+        x-schema-version:
+          type: string
+          example: '1.0.0'
+
+    MoneyAmount:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^\d+\.\d{4}$'
+          example: '1250.0000'
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: 'INR'
+
+    EventStatus:
+      type: string
+      enum:
+        - DRAFT
+        - PENDING_APPROVAL
+        - PUBLISHED
+        - SOLD_OUT
+        - POSTPONED
+        - CANCELLED
+        - COMPLETED
+        - UNDER_REVIEW
+
+    PublishEventPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - requestedBy
+        - requestedByRole
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        requestedBy:
+          type: string
+          format: uuid
+          description: adminId or organiserId who initiated the publish.
+        requestedByRole:
+          type: string
+          enum: [ADMIN, ORGANISER]
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    CancelEventPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - cancellationSource
+        - reason
+        - requestedBy
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        cancellationSource:
+          type: string
+          enum: [ORGANISER, ADMIN, VENUE_SUSPENDED]
+          description: |
+            VENUE_SUSPENDED: this command is published by the Event Service
+            itself when consuming venue.events:venue.suspended. The Event
+            Service acts as its own command publisher for cascade scenarios.
+        reason:
+          type: string
+          maxLength: 1000
+        requestedBy:
+          type: string
+          format: uuid
+          description: adminId, organiserId, or venueId depending on cancellationSource.
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    PostponeEventPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - newStartDateTime
+        - newEndDateTime
+        - reason
+        - requestedBy
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        previousStartDateTime:
+          type: string
+          format: date-time
+        previousEndDateTime:
+          type: string
+          format: date-time
+        newStartDateTime:
+          type: string
+          format: date-time
+        newEndDateTime:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          maxLength: 1000
+        requestedBy:
+          type: string
+          format: uuid
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    UpdateEventStatusPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - targetStatus
+        - requestedBy
+        - requestedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        targetStatus:
+          $ref: '#/components/schemas/EventStatus'
+        reason:
+          type: string
+          maxLength: 1000
+        requestedBy:
+          type: string
+          format: uuid
+        requestedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    EventPublishedPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - eventName
+        - organiserId
+        - venueId
+        - venueName
+        - startDateTime
+        - endDateTime
+        - totalSeatCapacity
+        - availableSeatCount
+        - categories
+        - priceRange
+        - publishedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        eventName:
+          type: string
+          maxLength: 256
+        organiserId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        venueName:
+          type: string
+          maxLength: 256
+        venueCity:
+          type: string
+        startDateTime:
+          type: string
+          format: date-time
+        endDateTime:
+          type: string
+          format: date-time
+        totalSeatCapacity:
+          type: integer
+          minimum: 1
+        availableSeatCount:
+          type: integer
+          minimum: 0
+        categories:
+          type: array
+          items:
+            type: string
+          description: Event categories (e.g., ["Music", "Rock"]). Used for search facets.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Free-form tags for semantic search and recommendation features.
+        priceRange:
+          type: object
+          required: [minPrice, maxPrice]
+          description: Denormalized for Search Service filter indexing.
+          properties:
+            minPrice:
+              $ref: '#/components/schemas/MoneyAmount'
+            maxPrice:
+              $ref: '#/components/schemas/MoneyAmount'
+        posterImageUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: MinIO URL of event poster (used by recommendation + search for image search Phase 5).
+        publishedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    EventCancelledPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - venueId
+        - organiserId
+        - cancellationSource
+        - confirmedBookingCount
+        - cancelledAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        cancellationSource:
+          type: string
+          enum: [ORGANISER, ADMIN, VENUE_SUSPENDED]
+        cancellationReason:
+          type: string
+          maxLength: 1000
+        confirmedBookingCount:
+          type: integer
+          minimum: 0
+          description: |
+            Number of CONFIRMED bookings at cancellation time. Used by consumers
+            to anticipate fan-out volume. The Booking Service fan-out will produce
+            exactly this many booking.refund-requested messages (if all are still
+            CONFIRMED — some may already be CANCELLED from prior operations).
+        cancelledAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    EventPostponedPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - organiserId
+        - venueId
+        - previousStartDateTime
+        - newStartDateTime
+        - previousEndDateTime
+        - newEndDateTime
+        - postponedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        organiserId:
+          type: string
+          format: uuid
+        venueId:
+          type: string
+          format: uuid
+        previousStartDateTime:
+          type: string
+          format: date-time
+        newStartDateTime:
+          type: string
+          format: date-time
+        previousEndDateTime:
+          type: string
+          format: date-time
+        newEndDateTime:
+          type: string
+          format: date-time
+        reason:
+          type: string
+          maxLength: 1000
+        postponedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
+
+    EventStatusChangedPayload:
+      type: object
+      required:
+        - messageId
+        - eventId
+        - previousStatus
+        - newStatus
+        - changedAt
+        - schemaVersion
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        previousStatus:
+          $ref: '#/components/schemas/EventStatus'
+        newStatus:
+          $ref: '#/components/schemas/EventStatus'
+        changedBy:
+          type: string
+          format: uuid
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+        changedAt:
+          type: string
+          format: date-time
+        schemaVersion:
+          type: string
+          example: '1.0.0'
