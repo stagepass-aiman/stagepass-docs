@@ -1172,11 +1172,11 @@ build-breaking condition checked by `scripts/check-memory.sh`.
 
 | Field | Value |
 |-------|-------|
-| Statement | All services must emit structured JSON log events. Every log event must include the mandatory correlation fields: `traceId`, `spanId`, `service`, `timestamp` (UTC ISO-8601), `level`, and `message`. Transaction-scoped logs must also include `bookingId`, `eventId`, and `userId` where applicable. |
+| Statement | All services must emit structured JSON log events. Every log event must include the mandatory correlation fields: `trace_id`, `span_id`, `service`, `timestamp` (UTC ISO-8601), `level`, and `message`. Transaction-scoped logs must also include `bookingId`, `eventId`, and `userId` where applicable. |
 | Threshold | 100% of log events parseable as JSON; 100% of log events include mandatory fields; zero unstructured log output in any service; verified by log schema validation in CI |
 | Method | Log schema validation test: run service; perform a representative operation; capture stdout; parse each line as JSON; assert mandatory fields present; assert no lines fail JSON parse. Loki log volume check confirms logs are shipped. |
 | Traces To | PRD G-10, Section 10 (OBS-01), FR-A-001 AC4 (Admin action logging) |
-| Notes | Java: Logback with `logstash-logback-encoder`. Node: Pino (structured by default). Python: structlog or standard logging with JSON formatter. The `traceId` and `spanId` values are injected by the OpenTelemetry SDK (NFR-OBS-003) into the logging context via MDC (Java), AsyncLocalStorage (Node), or structlog context (Python). |
+| Notes | Java: Logback with `logstash-logback-encoder`. Node: Pino (structured by default). Python: structlog or standard logging with JSON formatter. The `trace_id` and `span_id` values are injected by the OpenTelemetry SDK (NFR-OBS-003) into the logging context via MDC (Java), AsyncLocalStorage (Node), or structlog context (Python). |
 
 ---
 

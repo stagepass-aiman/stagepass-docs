@@ -1050,7 +1050,7 @@ Both cascades must:
 These requirements apply to every service in the platform from the first service shipped. Observability is not added retrospectively.
 
 **OBS-01 — Structured Logging** `[NFR-OBS-001]`
-All services emit structured JSON logs. Every log event includes: `traceId`, `spanId`, `service`, `timestamp` (UTC ISO-8601), `level`, `message`, and where applicable: `bookingId`, `eventId`, `userId`. Logs are shipped to Loki via Promtail.
+All services emit structured JSON logs. Every log event includes: `trace_id`, `span_id`, `service`, `timestamp` (UTC ISO-8601), `level`, `message`, and where applicable: `bookingId`, `eventId`, `userId`. Logs are shipped to Loki via Promtail.
 
 **OBS-02 — Metrics** `[NFR-OBS-002]`
 All services expose `/metrics` in Prometheus format. RED metrics (Rate, Errors, Duration) are captured per endpoint. USE metrics (Utilisation, Saturation, Errors) are captured per resource (DB connections, Redis connections, Kafka consumer lag). Business metrics per NFR-OBS-005 are captured in the services that own the relevant data.

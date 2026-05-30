@@ -402,7 +402,7 @@ flowchart TB
     %% OBSERVABILITY (all services → all three pillars)
     %% Shown as aggregate; individual service lines omitted for clarity
     %% ─────────────────────────────────────────────
-    BOOKING  -- "OTel spans · RED metrics\nstructured logs + traceId + correlationId" --> JAEGER
+    BOOKING  -- "OTel spans · RED metrics\nstructured logs + trace_id + correlationId" --> JAEGER
     BOOKING  -- "/metrics (Prometheus format)" --> PROM
     BOOKING  -- "JSON logs · Promtail scrape" --> LOKI
 ```
@@ -632,7 +632,7 @@ gRPC, and Kafka message headers (NFR-OBS-003).
 | Pillar | Tooling | What it captures | Key NFR |
 |--------|---------|-----------------|---------|
 | **Metrics** | Prometheus + Grafana | RED per endpoint · USE per resource · business metrics (bookings/min, GMV/min, active holds, flash sale queue depth, waitlist depth, DLQ depth) | NFR-OBS-002, NFR-OBS-005 |
-| **Logs** | Loki + Promtail | Structured JSON, one event/line. Every line includes: `traceId`, `spanId`, `correlationId`, `bookingId`, `eventId`, `userId`, `service`, `timestamp UTC` | NFR-OBS-001 |
+| **Logs** | Loki + Promtail | Structured JSON, one event/line. Every line includes: `trace_id`, `span_id`, `correlationId`, `bookingId`, `eventId`, `userId`, `service`, `timestamp UTC` | NFR-OBS-001 |
 | **Traces** | Jaeger + OTel Collector | Distributed trace spanning API Gateway → Booking → Seat Inventory (gRPC) → Payment → Kafka → Ticket → WebSocket. W3C `traceparent` propagated across all transports. | NFR-OBS-003, NFR-OBS-004 |
 
 **Correlation ID vs Trace ID (distinction from ADR-003 §3.6):**
